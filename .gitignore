@@ -1,0 +1,43 @@
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Environment / package management
+# possibly overkill to use renv in beginner R context, but good practice in general
+renv/library/ 
+renv/staging/
+
+# Data files (keep structure, avoid committing sensitive/raw bulk files)
+data/raw/*
+!data/raw/.gitkeep
+
+# rendered reports
+*.html
+*.pdf
+
+# Outputs
+outputs/figures/*
+!outputs/figures/.gitkeep
+outputs/tables/*
+!outputs/tables/.gitkeep
+
+# figures
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# data objects
+*.xls
+*.xlsx
+*.csv
+*.rds
+.positai
