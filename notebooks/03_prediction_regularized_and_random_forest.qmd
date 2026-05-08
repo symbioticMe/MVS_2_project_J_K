@@ -1,0 +1,905 @@
+---
+title: "03 — Prediction, regularization, and Random Forest"
+subtitle: "Yield prediction under multicollinearity, small-sample limits, and nonlinear effects"
+author: "Project team"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Purpose of this notebook
+
+This notebook builds predictive models for final grain yield.
+
+The central scientific question is:
+
+> **Which variables best predict grain yield, and do nonlinear models improve prediction compared with linear/shrinkage models?**
+
+This notebook is primarily about **prediction**, not causal interpretation.
+
+The dataset is expected to be challenging because:
+
+- the number of observations is small;
+- the number of predictors is large relative to the sample size;
+- nutrient variables are strongly correlated;
+- fertilizer, soil, plant, grain, weather, biomass, and harvest variables are mechanistically linked;
+- nonlinear nutrient/weather effects are biologically plausible.
+
+Therefore, this notebook compares:
+
+1.  ordinary linear regression;
+2.  Ridge regression;
+3.  Lasso regression;
+4.  Random Forest.
+
+The main evaluation criterion is cross-validated predictive performance.
+
+# Relationship to other notebooks
+
+This notebook uses outputs from Notebook 1 and Notebook 2.
+
+Notebook 1 showed:
+
+- correlation structure;
+- multicollinearity;
+- PCA structure;
+- possible nonlinear relationships;
+- preprocessing/scaling needs.
+
+Notebook 2 showed:
+
+- whether fertilizer type appears predictive;
+- whether year/weather adjustment is necessary;
+- how uncertain fertilizer differences are.
+
+This notebook produces results used in Notebook 4, especially:
+
+- important predictors;
+- nonlinear dependency plots;
+- evidence for nutrient/weather interactions;
+- limits of yield prediction.
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(pdp)
+library(vip)
+library(broom)
+library(patchwork)
+library(yardstick)
+```
+
+# Load data
+
+```{r}
+dat <- readRDS("outputs/cleaned_data.rds")
+
+str(dat)
+```
+
+# Basic preprocessing
+
+```{r}
+dat <- dat %>%
+  mutate(
+    fertilizer_type = as.factor(fertilizer_type),
+    year = as.factor(year)
+  )
+```
+
+# Define variable groups
+
+```{r}
+fertilizer_vars <- c(
+  "fertilizer_n",
+  "fertilizer_phosphate",
+  "fertilizer_k",
+  "fertilizer_ca",
+  "fertilizer_mg"
+)
+
+soil_vars <- c(
+  "soil_n",
+  "soil_phosphate",
+  "soil_k",
+  "soil_ca",
+  "soil_mg"
+)
+
+plant_vars <- c(
+  "plant_n",
+  "plant_phosphate",
+  "plant_k",
+  "plant_ca",
+  "plant_mg"
+)
+
+grain_nutrient_vars <- c(
+  "grain_n",
+  "grain_phosphate",
+  "grain_k",
+  "grain_ca",
+  "grain_mg"
+)
+
+weather_vars <- c(
+  "rain_total_mm_mar",
+  "rain_total_mm_apr",
+  "consecutive_dry_days_may",
+  "heat_days_gt30_may",
+  "heat_days_gt30_jun",
+  "gdd_base5_apr"
+)
+
+response_vars <- c(
+  "total_biomass",
+  "harvest_index",
+  "grain_yield"
+)
+```
+
+# Modeling philosophy
+
+This notebook compares models with different assumptions.
+
+| Model         | Role                                        |
+|---------------|---------------------------------------------|
+| OLS           | interpretable baseline                      |
+| Ridge         | handles correlated predictors via shrinkage |
+| Lasso         | sparse feature selection                    |
+| Random Forest | nonlinear benchmark and dependency plots    |
+
+Because the dataset is small, the goal is not only to find the lowest prediction error.
+
+The goal is also to understand:
+
+- whether prediction is possible at all;
+- whether shrinkage improves stability;
+- whether Lasso-selected variables are plausible;
+- whether Random Forest suggests nonlinear effects;
+- whether the dataset reaches its predictive limit.
+
+# Outcome
+
+```{r}
+outcome <- "grain_yield"
+```
+
+# Predictor sets
+
+We define several candidate predictor sets.
+
+This is important because using all variables blindly may overfit.
+
+## Predictor set A: upstream agronomic predictors
+
+This set uses variables that are available before or during the growing season.
+
+```{r}
+predictors_upstream <- c(
+  "fertilizer_type",
+  fertilizer_vars,
+  weather_vars
+)
+```
+
+## Predictor set B: nutrient-state predictors
+
+This set includes soil and plant nutrients.
+
+It may improve prediction but is less directly intervention-oriented because plant nutrients are downstream of fertilizer and weather.
+
+```{r}
+predictors_nutrient_state <- c(
+  "fertilizer_type",
+  fertilizer_vars,
+  soil_vars,
+  plant_vars,
+  weather_vars
+)
+```
+
+## Predictor set C: full predictive set
+
+This includes biomass and harvest index.
+
+This may predict yield well but is not useful for early-season prediction and is not appropriate for estimating total fertilizer effects, because biomass and harvest index are downstream mediators.
+
+```{r}
+predictors_full_predictive <- c(
+  "fertilizer_type",
+  fertilizer_vars,
+  soil_vars,
+  plant_vars,
+  grain_nutrient_vars,
+  weather_vars,
+  "total_biomass",
+  "harvest_index"
+)
+```
+
+# Choose primary predictor set
+
+For the main analysis, we use the nutrient-state predictor set.
+
+This gives a compromise between biological relevance and predictive power.
+
+```{r}
+predictors_main <- predictors_nutrient_state
+```
+
+```{r}
+model_dat <- dat %>%
+  select(all_of(c(outcome, predictors_main))) %>%
+  drop_na()
+
+dim(model_dat)
+```
+
+# Initial checks
+
+## Outcome distribution
+
+```{r}
+ggplot(model_dat, aes(x = grain_yield)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of grain yield",
+    x = "Grain yield",
+    y = "Count"
+  )
+```
+
+## Predictor-to-sample-size ratio
+
+```{r}
+n_obs <- nrow(model_dat)
+n_pred_numeric <- model_dat %>%
+  select(-grain_yield) %>%
+  model.matrix(~ ., data = .) %>%
+  ncol()
+
+tibble(
+  n_observations = n_obs,
+  n_model_matrix_columns = n_pred_numeric,
+  ratio_predictors_to_observations = n_pred_numeric / n_obs
+)
+```
+
+## Draft interpretation
+
+> The model matrix contains \[insert number\] predictor columns for \[insert number\] observations. This confirms that ordinary regression is likely to be unstable, motivating Ridge, Lasso, and cross-validation.
+
+# Cross-validation strategy
+
+Because the dataset is small, we avoid a simple train/test split.
+
+Instead, we use:
+
+- LOOCV if the dataset is very small;
+- repeated k-fold CV if there are enough observations.
+
+The default below uses repeated k-fold CV.
+
+If the number of observations is extremely small, switch to LOOCV.
+
+```{r}
+set.seed(123)
+
+if (nrow(model_dat) < 50) {
+  cv_method <- "LOOCV"
+  train_control <- trainControl(method = "LOOCV")
+} else {
+  cv_method <- "repeatedcv"
+  train_control <- trainControl(method = "repeatedcv", number = 5, repeats = 20)
+}
+
+cv_method
+```
+
+# Helper function for metrics
+
+```{r}
+calc_metrics <- function(obs, pred) {
+  tibble(
+    RMSE = sqrt(mean((obs - pred)^2)),
+    MAE = mean(abs(obs - pred)),
+    R2 = cor(obs, pred)^2
+  )
+}
+```
+
+# Model 1: ordinary linear regression
+
+## Scientific role
+
+OLS is used as the baseline model.
+
+It is interpretable but expected to be unstable under multicollinearity.
+
+```{r}
+set.seed(123)
+
+mod_ols <- train(
+  grain_yield ~ .,
+  data = model_dat,
+  method = "lm",
+  trControl = train_control,
+  metric = "RMSE"
+)
+
+mod_ols
+```
+
+## OLS coefficients
+
+```{r}
+ols_final <- lm(grain_yield ~ ., data = model_dat)
+
+broom::tidy(ols_final) %>%
+  arrange(p.value) %>%
+  head(20)
+```
+
+## OLS diagnostics
+
+```{r}
+par(mfrow = c(2, 2))
+plot(ols_final)
+par(mfrow = c(1, 1))
+```
+
+## Draft interpretation
+
+> The OLS baseline produced \[insert CV RMSE\] but showed \[large coefficient uncertainty / unstable signs / diagnostic issues\]. Given the correlation structure observed in Notebook 1, OLS coefficients should not be overinterpreted.
+
+# Model 2: Ridge regression
+
+## Scientific role
+
+Ridge regression is useful when predictors are highly correlated.
+
+It shrinks coefficients toward zero but usually keeps correlated predictors in the model.
+
+This is appropriate for nutrient variables because many of them are biologically linked.
+
+# Prepare model matrix
+
+```{r}
+x <- model.matrix(grain_yield ~ ., data = model_dat)[, -1]
+y <- model_dat$grain_yield
+```
+
+## Fit Ridge with cross-validation
+
+```{r}
+set.seed(123)
+
+cv_ridge <- cv.glmnet(
+  x = x,
+  y = y,
+  alpha = 0,
+  standardize = TRUE
+)
+
+plot(cv_ridge)
+```
+
+```{r}
+ridge_lambda_min <- cv_ridge$lambda.min
+ridge_lambda_1se <- cv_ridge$lambda.1se
+
+ridge_lambda_min
+ridge_lambda_1se
+```
+
+## Ridge coefficients
+
+```{r}
+ridge_coef <- coef(cv_ridge, s = "lambda.1se")
+
+ridge_coef_df <- as.matrix(ridge_coef) %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename(coefficient = s1) %>%
+  arrange(desc(abs(coefficient)))
+
+ridge_coef_df %>% head(25)
+```
+
+## Ridge coefficient path
+
+```{r}
+ridge_fit <- glmnet(x, y, alpha = 0, standardize = TRUE)
+
+plot(ridge_fit, xvar = "lambda", label = FALSE)
+title("Ridge coefficient paths")
+```
+
+## Draft interpretation
+
+> Ridge regression shrank the coefficients of correlated predictors and produced a more stable model than OLS. Important variables according to Ridge were \[insert variables\]. Because Ridge keeps correlated variables rather than selecting only one, it is useful for this nutrient-flow dataset.
+
+# Model 3: Lasso regression
+
+## Scientific role
+
+Lasso regression performs feature selection by shrinking some coefficients exactly to zero.
+
+This is useful for identifying a sparse predictive subset, but it must be interpreted cautiously when predictors are strongly correlated.
+
+In correlated nutrient blocks, Lasso may select one variable as a proxy for several related variables.
+
+## Fit Lasso with cross-validation
+
+```{r}
+set.seed(123)
+
+cv_lasso <- cv.glmnet(
+  x = x,
+  y = y,
+  alpha = 1,
+  standardize = TRUE
+)
+
+plot(cv_lasso)
+```
+
+```{r}
+lasso_lambda_min <- cv_lasso$lambda.min
+lasso_lambda_1se <- cv_lasso$lambda.1se
+
+lasso_lambda_min
+lasso_lambda_1se
+```
+
+## Lasso coefficients
+
+```{r}
+lasso_coef <- coef(cv_lasso, s = "lambda.1se")
+
+lasso_coef_df <- as.matrix(lasso_coef) %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  rename(coefficient = s1) %>%
+  filter(coefficient != 0) %>%
+  arrange(desc(abs(coefficient)))
+
+lasso_coef_df
+```
+
+## Lasso coefficient path
+
+```{r}
+lasso_fit <- glmnet(x, y, alpha = 1, standardize = TRUE)
+
+plot(lasso_fit, xvar = "lambda", label = FALSE)
+title("Lasso coefficient paths")
+```
+
+## Draft interpretation
+
+> Lasso selected \[insert variables\] as the sparse predictive set. Because several nutrients are highly correlated, this selection should be interpreted as identifying predictive proxies rather than definitive mechanistic causes. If Lasso selected only one member of a correlated nutrient block, this may reflect statistical competition among predictors.
+
+# Model 4: Random Forest
+
+## Scientific role
+
+Random Forest is included because nonlinear nutrient and weather effects are biologically plausible.
+
+Examples:
+
+- drought thresholds;
+- heat stress effects;
+- nutrient saturation;
+- phosphate-dependent nitrogen uptake;
+- interactions among weather and nutrient availability.
+
+Random Forest can capture nonlinearities and interactions without specifying them in advance.
+
+However, with small data, RF may also be unstable and should be interpreted cautiously.
+
+# Fit Random Forest
+
+```{r}
+set.seed(123)
+
+mod_rf <- randomForest(
+  grain_yield ~ .,
+  data = model_dat,
+  ntree = 1000,
+  importance = TRUE
+)
+
+mod_rf
+```
+
+# Random Forest cross-validation using caret
+
+```{r}
+set.seed(123)
+
+mod_rf_cv <- train(
+  grain_yield ~ .,
+  data = model_dat,
+  method = "rf",
+  trControl = train_control,
+  metric = "RMSE",
+  tuneLength = 5,
+  importance = TRUE
+)
+
+mod_rf_cv
+```
+
+# RF variable importance
+
+```{r}
+varImpPlot(mod_rf, main = "Random Forest variable importance")
+```
+
+```{r}
+vip::vip(mod_rf_cv, num_features = 20) +
+  labs(title = "Random Forest variable importance")
+```
+
+## Draft interpretation
+
+> Random Forest identified \[insert variables\] as important predictors of grain yield. Because variable importance is affected by correlated predictors, the ranking should be interpreted as predictive importance rather than causal importance.
+
+# Random Forest dependency plots
+
+## Purpose
+
+Dependency plots are used to explore nonlinear associations learned by the Random Forest.
+
+They are especially useful for:
+
+- nutrient response shapes;
+- drought thresholds;
+- heat stress effects;
+- nutrient-weather interactions.
+
+They are not causal effects.
+
+# Select variables for dependency plots
+
+Choose variables based on:
+
+- RF variable importance;
+- biological plausibility;
+- EDA findings;
+- causal questions in Notebook 4.
+
+Suggested variables:
+
+- `plant_n`
+- `plant_phosphate`
+- `soil_n`
+- `soil_phosphate`
+- `consecutive_dry_days_may`
+- `heat_days_gt30_jun`
+- `fertilizer_n`
+
+```{r}
+dep_vars <- c(
+  "plant_n",
+  "plant_phosphate",
+  "soil_n",
+  "soil_phosphate",
+  "consecutive_dry_days_may",
+  "heat_days_gt30_jun",
+  "fertilizer_n"
+)
+
+dep_vars <- dep_vars[dep_vars %in% names(model_dat)]
+dep_vars
+```
+
+## One-dimensional partial dependence plots
+
+```{r}
+for (v in dep_vars) {
+  print(
+    partialPlot(
+      mod_rf,
+      pred.data = model_dat,
+      x.var = v,
+      main = paste("RF partial dependence:", v),
+      xlab = v,
+      ylab = "Predicted grain yield"
+    )
+  )
+}
+```
+
+# Two-dimensional dependency plots
+
+## Nutrient interaction: soil_N × soil_phosphate
+
+This plot connects directly to the causal-mechanism question in Notebook 4.
+
+```{r}
+if (all(c("soil_n", "soil_phosphate") %in% names(model_dat))) {
+  pd_soil_n_p <- partial(
+    mod_rf,
+    pred.var = c("soil_n", "soil_phosphate"),
+    train = model_dat,
+    grid.resolution = 25
+  )
+
+  autoplot(pd_soil_n_p, contour = TRUE) +
+    theme_minimal() +
+    labs(
+      title = "RF partial dependence surface: soil_N × soil_phosphate",
+      subtitle = "Outcome: predicted grain yield",
+      x = "Soil nitrogen",
+      y = "Soil phosphate"
+    )
+}
+```
+
+## Weather interaction: soil_N × drought
+
+This plot explores whether drought modifies nitrogen usefulness for yield.
+
+```{r}
+if (all(c("soil_n", "consecutive_dry_days_may") %in% names(model_dat))) {
+  pd_soil_n_drought <- partial(
+    mod_rf,
+    pred.var = c("soil_n", "consecutive_dry_days_may"),
+    train = model_dat,
+    grid.resolution = 25
+  )
+
+  autoplot(pd_soil_n_drought, contour = TRUE) +
+    theme_minimal() +
+    labs(
+      title = "RF partial dependence surface: soil_N × May dry-days",
+      subtitle = "Outcome: predicted grain yield",
+      x = "Soil nitrogen",
+      y = "Consecutive dry days in May"
+    )
+}
+```
+
+## Plant nutrient interaction: plant_N × plant_phosphate
+
+```{r}
+if (all(c("plant_n", "plant_phosphate") %in% names(model_dat))) {
+  pd_plant_n_p <- partial(
+    mod_rf,
+    pred.var = c("plant_n", "plant_phosphate"),
+    train = model_dat,
+    grid.resolution = 25
+  )
+
+  autoplot(pd_plant_n_p, contour = TRUE) +
+    theme_minimal() +
+    labs(
+      title = "RF partial dependence surface: plant_N × plant_phosphate",
+      subtitle = "Outcome: predicted grain yield",
+      x = "Plant nitrogen",
+      y = "Plant phosphate"
+    )
+}
+```
+
+## Draft interpretation
+
+> The Random Forest dependency plots suggested \[linear / nonlinear / threshold-like / saturating\] relationships between key predictors and grain yield. In particular, \[insert variable\] showed evidence of \[threshold / plateau / monotonic effect\]. These patterns motivate the mechanistic interaction models and RF uptake analyses in Notebook 4.
+
+# Compare model performance
+
+## Collect resampling results
+
+```{r}
+resamples_list <- resamples(
+  list(
+    OLS = mod_ols,
+    RF = mod_rf_cv
+  )
+)
+
+summary(resamples_list)
+bwplot(resamples_list, metric = "RMSE")
+```
+
+`glmnet::cv.glmnet` uses its own CV procedure, so Ridge and Lasso results are summarized separately.
+
+```{r}
+ridge_cv_rmse <- sqrt(min(cv_ridge$cvm))
+lasso_cv_rmse <- sqrt(min(cv_lasso$cvm))
+
+glmnet_perf <- tibble(
+  model = c("Ridge", "Lasso"),
+  cv_rmse = c(ridge_cv_rmse, lasso_cv_rmse),
+  lambda_min = c(ridge_lambda_min, lasso_lambda_min),
+  lambda_1se = c(ridge_lambda_1se, lasso_lambda_1se)
+)
+
+glmnet_perf
+```
+
+## Caret model performance table
+
+```{r}
+caret_perf <- tibble(
+  model = c("OLS", "Random Forest"),
+  cv_rmse = c(
+    min(mod_ols$results$RMSE, na.rm = TRUE),
+    min(mod_rf_cv$results$RMSE, na.rm = TRUE)
+  )
+)
+
+performance_table <- bind_rows(caret_perf, glmnet_perf %>% select(model, cv_rmse)) %>%
+  arrange(cv_rmse)
+
+performance_table
+```
+
+```{r}
+ggplot(performance_table, aes(x = reorder(model, cv_rmse), y = cv_rmse)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Cross-validated prediction performance",
+    x = "Model",
+    y = "CV RMSE"
+  )
+```
+
+## Draft interpretation
+
+> The best cross-validated RMSE was obtained by \[insert model\]. Ridge/Lasso performance relative to OLS suggests that \[shrinkage helped / shrinkage did not help much\]. Random Forest performance suggests that nonlinearities \[may / may not\] improve prediction. Given the small sample size, small differences in CV error should not be overinterpreted.
+
+# Sensitivity analysis: upstream-only predictors
+
+## Motivation
+
+The main model includes soil and plant nutrients, which are useful for prediction but downstream of fertilizer and weather.
+
+For an early-season or intervention-oriented prediction model, we may want to use only:
+
+- fertilizer variables;
+- fertilizer type;
+- weather variables.
+
+```{r}
+model_dat_upstream <- dat %>%
+  select(all_of(c(outcome, predictors_upstream))) %>%
+  drop_na()
+
+dim(model_dat_upstream)
+```
+
+```{r}
+set.seed(123)
+
+mod_rf_upstream <- train(
+  grain_yield ~ .,
+  data = model_dat_upstream,
+  method = "rf",
+  trControl = train_control,
+  metric = "RMSE",
+  tuneLength = 5,
+  importance = TRUE
+)
+
+mod_rf_upstream
+```
+
+```{r}
+set.seed(123)
+
+mod_lm_upstream <- train(
+  grain_yield ~ .,
+  data = model_dat_upstream,
+  method = "lm",
+  trControl = train_control,
+  metric = "RMSE"
+)
+
+mod_lm_upstream
+```
+
+## Draft interpretation
+
+> The upstream-only models achieved \[higher / similar / lower\] prediction error compared with the nutrient-state models. This suggests that downstream plant and soil measurements \[add / do not add\] predictive information for yield. However, upstream-only models may be more useful for intervention planning because they avoid conditioning on downstream mediators.
+
+# Small-sample interpretation
+
+## What can be learned
+
+This notebook can support conclusions about:
+
+- approximate predictive performance;
+- relative value of shrinkage vs flexible nonlinear models;
+- candidate predictive variables;
+- possible nonlinear patterns;
+- model instability under small sample size.
+
+## What cannot be learned reliably
+
+This notebook cannot definitively establish:
+
+- causal effects;
+- exact mechanistic pathways;
+- stable feature rankings;
+- fertilizer superiority;
+- robust nonlinear effects without uncertainty.
+
+# Save outputs for downstream notebooks
+
+```{r}
+dir.create("outputs", showWarnings = FALSE)
+
+saveRDS(performance_table, "outputs/prediction_performance_table.rds")
+saveRDS(ridge_coef_df, "outputs/ridge_coefficients.rds")
+saveRDS(lasso_coef_df, "outputs/lasso_selected_variables.rds")
+saveRDS(mod_rf, "outputs/random_forest_yield_model.rds")
+saveRDS(mod_rf_cv, "outputs/random_forest_cv_model.rds")
+```
+
+# How this notebook informs downstream analyses
+
+## Notebook 4 — Causal DAG mechanisms
+
+This notebook informs the causal/mechanistic notebook in several ways.
+
+### Important predictors
+
+Variables with high predictive importance become candidates for mechanistic interpretation.
+
+However:
+
+> Predictive importance is not causal importance.
+
+### Nonlinear effects
+
+RF dependency plots can identify:
+
+- threshold-like drought effects;
+- nutrient saturation;
+- phosphate–nitrogen interactions;
+- nutrient-weather interactions.
+
+These patterns motivate the targeted mechanistic analyses in Notebook 4.
+
+### Model comparison
+
+If Random Forest clearly outperforms linear/shrinkage models, this suggests that nonlinear effects or interactions may matter.
+
+If Random Forest does not outperform simpler models, then the dataset may be too small to learn nonlinear structure reliably.
+
+Both outcomes are scientifically informative.
+
+## Final project synthesis
+
+This notebook contributes to the final project conclusion by answering:
+
+- how well yield can be predicted;
+- whether shrinkage is necessary;
+- whether feature selection is stable enough to trust;
+- whether nonlinear models provide added value;
+- where the dataset reaches its predictive limit.
+
+# Final interpretation draft
+
+Replace after analysis.
+
+> This notebook compared linear, regularized, and nonlinear models for grain yield prediction. The results showed that \[insert best model\] achieved the strongest cross-validated performance. Ridge regression \[did / did not\] improve stability under multicollinearity, while Lasso selected \[insert variables\] but should be interpreted cautiously because correlated nutrient variables compete during selection. Random Forest dependency plots suggested \[insert nonlinear patterns\], motivating the DAG-guided mechanism analyses in Notebook 4. Overall, the prediction results indicate that the dataset contains \[some / limited / strong\] predictive signal, but small sample size and correlated predictors limit definitive interpretation.

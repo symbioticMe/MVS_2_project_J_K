@@ -1,0 +1,658 @@
+---
+title: "04 — Causal DAG mechanisms and synthesis"
+subtitle: "Phosphate-dependent nitrogen uptake, drought-dependent nutrient uptake, and implications for yield prediction"
+author: "Project team"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+  pptx:
+    slide-level: 2
+execute:
+  eval: false
+  echo: true
+  warning: false
+  message: false
+---
+
+# Purpose of this notebook
+
+This notebook uses the assumed causal graph to formulate and test a small number of mechanistic questions.
+
+The primary goal is **not** to prove causality definitively. The dataset is small and observational, so the causal graph should be treated as a structured scientific assumption. The goal is to use the DAG to ask better questions, choose better adjustment variables, and interpret predictive models more carefully.
+
+The main scientific question in this notebook is:
+
+> **Does soil nitrogen translate into plant nitrogen only when phosphate availability is sufficient?**
+
+This is a mechanism question about nutrient uptake and conversion, rather than directly about final yield.
+
+The secondary question is:
+
+> **Does drought reduce nutrient uptake, especially the conversion of soil nitrogen into plant nitrogen?**
+
+Optional extensions connect these mechanisms back to yield prediction and use `dagitty` to formalize adjustment-set reasoning.
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(glmnet)
+library(randomForest)
+library(pdp)
+library(vip)
+# Optional:
+# library(dagitty)
+# library(ggdag)
+# library(lme4)
+```
+
+```{r}
+# Load outputs from Notebook 1
+# Adjust paths as needed
+
+dat <- readRDS("outputs/cleaned_data.rds")
+dat_scaled <- readRDS("outputs/scaled_data.rds")
+
+# Inspect structure
+skimr::skim(dat)
+```
+
+# Variable groups
+
+Define variable groups explicitly so that the models are transparent.
+
+```{r}
+weather_vars <- c(
+  "rain_total_mm_Mar",
+  "rain_total_mm_Apr",
+  "consecutive_dry_days_May",
+  "heat_days_gt30_May",
+  "heat_days_gt30_Jun",
+  "gdd_base5_Apr"
+)
+
+fertilizer_vars <- c(
+  "fertilizer_N",
+  "fertilizer_phosphate",
+  "fertilizer_K",
+  "fertilizer_Ca",
+  "fertilizer_Mg"
+)
+
+soil_vars <- c(
+  "soil_N",
+  "soil_phosphate",
+  "soil_K",
+  "soil_Ca",
+  "soil_Mg"
+)
+
+plant_vars <- c(
+  "plant_N",
+  "plant_phosphate",
+  "plant_K",
+  "plant_Ca",
+  "plant_Mg"
+)
+
+yield_vars <- c(
+  "total_biomass",
+  "harvest_index",
+  "grain_yield"
+)
+```
+
+# DAG-guided scientific framing
+
+The full DAG suggests the following nutrient pathway:
+
+``` text
+fertilizer_N -> soil_N -> plant_N -> grain_N / biomass / grain_yield
+```
+
+It also includes nutrient interactions, especially:
+
+``` text
+plant_phosphate -> plant_N
+plant_K         -> plant_N
+plant_Mg        -> plant_N
+soil_Ca         -> soil_phosphate
+```
+
+This motivates the main question of the notebook: nitrogen uptake may depend on phosphate availability.
+
+## Important causal distinction
+
+For this notebook, we distinguish:
+
+| Role | Example variables | Interpretation |
+|------------------------|------------------------|------------------------|
+| Exposure / upstream input | `soil_N`, `fertilizer_N` | Candidate causal driver |
+| Mechanistic modifier | `soil_phosphate`, `plant_phosphate`, `dryMay` | May change strength or shape of uptake |
+| Mediator | `plant_N`, `biomass`, `harvest_index` | Downstream variables in pathway |
+| Context / adjustment | `year`, weather variables | Environmental background |
+| Outcome | `plant_N`, `grain_yield` | Response variable |
+
+In this notebook, `plant_N` is usually an outcome for mechanism models. Therefore, downstream variables such as `grain_N`, `total_biomass`, `harvest_index`, or `grain_yield` should not be included as predictors in these mechanism models.
+
+# Main question: phosphate-dependent nitrogen uptake
+
+## Scientific question
+
+> Does soil nitrogen translate into plant nitrogen more strongly when phosphate availability is high?
+
+Biological intuition:
+
+- soil nitrogen alone may not be sufficient for plant nitrogen uptake;
+- phosphate availability may enable or limit nitrogen uptake;
+- the relationship may be nonlinear, with thresholds or saturation.
+
+## DAG motivation
+
+Relevant DAG fragment:
+
+``` text
+soil_N              -> plant_N
+soil_phosphate      -> plant_phosphate -> plant_N
+soil_Ca             -> soil_phosphate
+rainApr, dryMay, gddApr -> plant_N / plant_phosphate
+```
+
+## Main modeling strategy
+
+We use two complementary approaches:
+
+1.  **Linear interaction model** for interpretable effect estimates.
+2.  **Random Forest** for nonlinear and interaction exploration.
+
+The linear model asks whether there is evidence for a simple interaction.
+
+The Random Forest asks whether the data suggest nonlinear uptake patterns that a linear model may miss.
+
+Neither model proves causality by itself; both are interpreted under the assumptions encoded in the DAG.
+
+# Q1A — Linear interaction model
+
+## Model
+
+Primary model:
+
+``` text
+plant_N ~ soil_N * soil_phosphate + weather_covariates + year
+```
+
+Alternative model if plant phosphate is considered the more biologically direct availability measure:
+
+``` text
+plant_N ~ soil_N * plant_phosphate + weather_covariates + year
+```
+
+Use the first as the main model unless exploratory analysis suggests that `soil_phosphate` is too noisy or weakly measured.
+
+```{r}
+# Make sure year is treated as categorical unless there is a reason to model it as continuous
+
+dat <- dat %>%
+  mutate(year = as.factor(year))
+```
+
+```{r}
+mod_q1_linear <- lm(
+  plant_N ~ soil_N * soil_phosphate +
+    rain_total_mm_Apr + consecutive_dry_days_May + gdd_base5_Apr +
+    year,
+  data = dat
+)
+
+summary(mod_q1_linear)
+confint(mod_q1_linear)
+```
+
+## Model diagnostics
+
+```{r}
+par(mfrow = c(2, 2))
+plot(mod_q1_linear)
+par(mfrow = c(1, 1))
+```
+
+## Interaction visualization
+
+```{r}
+# Create prediction grid for soil_N and soil_phosphate
+
+grid_q1 <- expand_grid(
+  soil_N = seq(min(dat$soil_N, na.rm = TRUE), max(dat$soil_N, na.rm = TRUE), length.out = 50),
+  soil_phosphate = quantile(dat$soil_phosphate, probs = c(0.1, 0.5, 0.9), na.rm = TRUE),
+  rain_total_mm_Apr = median(dat$rain_total_mm_Apr, na.rm = TRUE),
+  consecutive_dry_days_May = median(dat$consecutive_dry_days_May, na.rm = TRUE),
+  gdd_base5_Apr = median(dat$gdd_base5_Apr, na.rm = TRUE),
+  year = levels(dat$year)[1]
+)
+
+grid_q1$pred_plant_N <- predict(mod_q1_linear, newdata = grid_q1)
+
+ggplot(grid_q1, aes(x = soil_N, y = pred_plant_N, color = as.factor(round(soil_phosphate, 2)))) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Linear interaction model: predicted plant N",
+    subtitle = "Lines show low, median, and high soil phosphate",
+    x = "Soil nitrogen",
+    y = "Predicted plant nitrogen",
+    color = "Soil phosphate"
+  ) +
+  theme_minimal()
+```
+
+## Draft interpretation template
+
+After running the analysis, replace the bracketed parts.
+
+> In the linear interaction model, the estimated interaction between soil nitrogen and soil phosphate was \[positive / negative / close to zero\]. This suggests that the soil-N to plant-N relationship \[strengthens / weakens / does not clearly change\] as phosphate availability increases. However, the uncertainty interval was \[wide / narrow\], which means the evidence is \[exploratory / reasonably stable\]. Given the small sample size, this result should be interpreted as a mechanistic hypothesis rather than a definitive causal estimate.
+
+# Q1B — Random Forest model for nonlinear uptake
+
+## Why use Random Forest here?
+
+The phosphate-dependent uptake hypothesis may involve:
+
+- nonlinear thresholds;
+- saturation;
+- local interactions;
+- different behavior at low vs high phosphate.
+
+A linear interaction model can only represent a simple planar interaction. Random Forest can detect more flexible nonlinear patterns.
+
+## Model target
+
+Outcome:
+
+``` text
+plant_N
+```
+
+Predictors:
+
+- `soil_N`
+- `soil_phosphate`
+- weather variables
+- optionally fertilizer nutrient variables
+- year
+
+Do **not** include downstream variables such as yield, biomass, harvest index, or grain nutrient variables.
+
+```{r}
+rf_q1_data <- dat %>%
+  select(
+    plant_N,
+    soil_N,
+    soil_phosphate,
+    rain_total_mm_Apr,
+    consecutive_dry_days_May,
+    gdd_base5_Apr,
+    fertilizer_N,
+    fertilizer_phosphate,
+    year
+  ) %>%
+  drop_na()
+
+set.seed(123)
+rf_q1 <- randomForest(
+  plant_N ~ .,
+  data = rf_q1_data,
+  ntree = 1000,
+  importance = TRUE
+)
+
+rf_q1
+```
+
+## Variable importance
+
+```{r}
+varImpPlot(rf_q1, main = "Random Forest variable importance: plant_N")
+```
+
+## Partial dependency plots
+
+```{r}
+partialPlot(rf_q1, pred.data = rf_q1_data, x.var = "soil_N", main = "Partial dependence: soil_N")
+partialPlot(rf_q1, pred.data = rf_q1_data, x.var = "soil_phosphate", main = "Partial dependence: soil_phosphate")
+```
+
+## Two-dimensional dependency plot: soil_N × soil_phosphate
+
+```{r}
+# Using pdp for a 2D partial dependence surface
+
+pd_q1_2d <- partial(
+  rf_q1,
+  pred.var = c("soil_N", "soil_phosphate"),
+  train = rf_q1_data,
+  grid.resolution = 25
+)
+
+autoplot(pd_q1_2d, contour = TRUE) +
+  labs(
+    title = "RF partial dependence surface: soil_N × soil_phosphate",
+    subtitle = "Outcome: predicted plant_N",
+    x = "Soil nitrogen",
+    y = "Soil phosphate"
+  ) +
+  theme_minimal()
+```
+
+## Compare linear model and RF
+
+```{r}
+# Optional simple in-sample comparison for exploration only.
+# For honest prediction performance, use CV as in Notebook 3.
+
+rf_q1_data$pred_lm <- predict(mod_q1_linear, newdata = rf_q1_data)
+rf_q1_data$pred_rf <- predict(rf_q1, newdata = rf_q1_data)
+
+rf_q1_data %>%
+  summarise(
+    rmse_lm = sqrt(mean((plant_N - pred_lm)^2)),
+    mae_lm = mean(abs(plant_N - pred_lm)),
+    rmse_rf = sqrt(mean((plant_N - pred_rf)^2)),
+    mae_rf = mean(abs(plant_N - pred_rf))
+  )
+```
+
+## Draft interpretation template
+
+> The Random Forest dependency plots showed \[approximately linear / threshold-like / saturating / irregular\] behavior for the relationship between soil nitrogen, soil phosphate, and plant nitrogen. Compared with the linear interaction model, the RF suggested that \[the linear model captured the main pattern / the relationship may be nonlinear / the evidence was too unstable to interpret\]. Because RF dependency plots are predictive and associational, we use them as hypothesis-generating evidence rather than causal proof.
+
+# Secondary question: drought-dependent nutrient uptake
+
+## Scientific question
+
+> Does drought weaken the conversion of soil nutrients into plant nutrients?
+
+Main focus:
+
+``` text
+soil_N -> plant_N
+```
+
+with drought as a possible modifier.
+
+## DAG motivation
+
+Relevant DAG fragment:
+
+``` text
+soil_N -> plant_N
+dryMay -> plant_N
+dryMay -> plant_K
+rainApr -> plant_N / plant_phosphate
+gddApr -> plant_N / plant_phosphate
+```
+
+# Q2A — Linear drought interaction model
+
+## Model
+
+``` text
+plant_N ~ soil_N * consecutive_dry_days_May + rainApr + gddApr + year
+```
+
+```{r}
+mod_q2_linear <- lm(
+  plant_N ~ soil_N * consecutive_dry_days_May +
+    rain_total_mm_Apr + gdd_base5_Apr + year,
+  data = dat
+)
+
+summary(mod_q2_linear)
+confint(mod_q2_linear)
+```
+
+## Interaction visualization
+
+```{r}
+grid_q2 <- expand_grid(
+  soil_N = seq(min(dat$soil_N, na.rm = TRUE), max(dat$soil_N, na.rm = TRUE), length.out = 50),
+  consecutive_dry_days_May = quantile(dat$consecutive_dry_days_May, probs = c(0.1, 0.5, 0.9), na.rm = TRUE),
+  rain_total_mm_Apr = median(dat$rain_total_mm_Apr, na.rm = TRUE),
+  gdd_base5_Apr = median(dat$gdd_base5_Apr, na.rm = TRUE),
+  year = levels(dat$year)[1]
+)
+
+grid_q2$pred_plant_N <- predict(mod_q2_linear, newdata = grid_q2)
+
+ggplot(grid_q2, aes(x = soil_N, y = pred_plant_N, color = as.factor(round(consecutive_dry_days_May, 2)))) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Linear interaction model: drought-dependent N uptake",
+    subtitle = "Lines show low, median, and high May dry-days",
+    x = "Soil nitrogen",
+    y = "Predicted plant nitrogen",
+    color = "Dry days in May"
+  ) +
+  theme_minimal()
+```
+
+## Draft interpretation template
+
+> The linear drought interaction model suggests that the soil-N to plant-N relationship \[weakens / strengthens / remains similar\] under longer dry periods in May. The interaction estimate was \[negative / positive / close to zero\], which is \[consistent / not consistent\] with the hypothesis that drought limits nitrogen uptake. Because year and weather variables are partly entangled in only five years of observations, this result should be interpreted cautiously.
+
+# Q2B — Random Forest drought exploration
+
+## Model target
+
+Outcome:
+
+``` text
+plant_N
+```
+
+Predictors:
+
+- `soil_N`
+- `consecutive_dry_days_May`
+- other weather variables
+- phosphate variables
+- fertilizer nutrient variables
+- year
+
+```{r}
+rf_q2_data <- dat %>%
+  select(
+    plant_N,
+    soil_N,
+    soil_phosphate,
+    rain_total_mm_Apr,
+    consecutive_dry_days_May,
+    heat_days_gt30_May,
+    gdd_base5_Apr,
+    fertilizer_N,
+    fertilizer_phosphate,
+    year
+  ) %>%
+  drop_na()
+
+set.seed(123)
+rf_q2 <- randomForest(
+  plant_N ~ .,
+  data = rf_q2_data,
+  ntree = 1000,
+  importance = TRUE
+)
+
+rf_q2
+```
+
+## Variable importance
+
+```{r}
+varImpPlot(rf_q2, main = "Random Forest variable importance: drought and plant_N")
+```
+
+## Partial dependency plots
+
+```{r}
+partialPlot(rf_q2, pred.data = rf_q2_data, x.var = "consecutive_dry_days_May", main = "Partial dependence: May dry days")
+partialPlot(rf_q2, pred.data = rf_q2_data, x.var = "soil_N", main = "Partial dependence: soil_N")
+```
+
+## Two-dimensional dependency plot: soil_N × dry days
+
+```{r}
+pd_q2_2d <- partial(
+  rf_q2,
+  pred.var = c("soil_N", "consecutive_dry_days_May"),
+  train = rf_q2_data,
+  grid.resolution = 25
+)
+
+autoplot(pd_q2_2d, contour = TRUE) +
+  labs(
+    title = "RF partial dependence surface: soil_N × May dry-days",
+    subtitle = "Outcome: predicted plant_N",
+    x = "Soil nitrogen",
+    y = "Consecutive dry days in May"
+  ) +
+  theme_minimal()
+```
+
+## Draft interpretation template
+
+> The RF dependency plots suggested that drought effects on plant nitrogen were \[roughly monotonic / threshold-like / weak / unstable\]. In particular, the soil_N × dry-days surface showed \[a reduced soil-N effect under high drought / no clear interaction / a complex pattern\]. This supports the idea that drought may modify nutrient uptake, but the small sample size prevents strong mechanistic conclusions.
+
+# Link back to yield prediction
+
+The yield prediction notebook focuses on predicting `grain_yield`. This notebook supports that task by identifying possible nonlinear and mechanistic structure upstream of yield.
+
+Possible implications:
+
+1.  If phosphate-dependent N uptake is visible, yield models should consider interactions or nonlinear terms involving N and phosphate.
+2.  If drought modifies nutrient uptake, yield models should include weather × nutrient interactions or use flexible models such as Random Forest.
+3.  If RF shows stronger structure than linear interaction models, nonlinear yield prediction may be justified.
+4.  If all mechanism models are unstable, the project can conclude that the dataset reaches its inferential limit for mechanistic claims.
+
+# Optional extension 1: causal reasoning for yield prediction
+
+## Scientific question
+
+> What is the total effect of fertilizer nitrogen on grain yield?
+
+DAG pathway:
+
+``` text
+fertilizer_N -> soil_N -> plant_N -> biomass / grain_yield
+```
+
+If the goal is total fertilizer effect, then downstream mediators should not be adjusted for.
+
+Potential total-effect model:
+
+``` text
+grain_yield ~ fertilizer_N + weather_covariates + year
+```
+
+Predictive model for comparison:
+
+``` text
+grain_yield ~ fertilizer_N + soil_N + plant_N + plant_phosphate + weather_covariates + year
+```
+
+Interpretation:
+
+- The first model is closer to a total-effect causal model.
+- The second model may predict better but blocks part of the fertilizer pathway.
+- Therefore, the same variable can be useful for prediction but inappropriate for estimating a total causal effect.
+
+```{r}
+mod_yield_total_effect <- lm(
+  grain_yield ~ fertilizer_N +
+    rain_total_mm_Apr + consecutive_dry_days_May + heat_days_gt30_Jun + gdd_base5_Apr +
+    year,
+  data = dat
+)
+
+summary(mod_yield_total_effect)
+```
+
+```{r}
+mod_yield_predictive <- lm(
+  grain_yield ~ fertilizer_N + soil_N + plant_N + plant_phosphate +
+    rain_total_mm_Apr + consecutive_dry_days_May + heat_days_gt30_Jun + gdd_base5_Apr +
+    year,
+  data = dat
+)
+
+summary(mod_yield_predictive)
+```
+
+## Draft interpretation template
+
+> The total-effect style model estimated the association between fertilizer nitrogen and yield without adjusting for downstream nutrient states. The predictive model included soil and plant nutrient variables and therefore changed the interpretation of the fertilizer coefficient. If the fertilizer coefficient became smaller after adding plant nutrients, this may indicate that part of the fertilizer effect operates through soil and plant nutrient pathways. However, because this is observational data and the sample is small, this should be interpreted as DAG-guided evidence rather than a definitive causal decomposition.
+
+# Optional extension 2: formal DAG with dagitty
+
+Use this section only if time permits.
+
+## Goal
+
+Use `dagitty` to encode a simplified DAG and inspect adjustment sets.
+
+```{r eval=FALSE}
+library(dagitty)
+
+fert_dag <- dagitty('dag {
+  fertilizer_N -> soil_N
+  soil_N -> plant_N
+  plant_N -> total_biomass
+  plant_N -> grain_yield
+  total_biomass -> harvest_index
+  harvest_index -> grain_yield
+
+  fertilizer_phosphate -> soil_phosphate
+  soil_phosphate -> plant_phosphate
+  plant_phosphate -> plant_N
+  soil_Ca -> soil_phosphate
+
+  rain_total_mm_Apr -> plant_N
+  rain_total_mm_Apr -> plant_phosphate
+  consecutive_dry_days_May -> plant_N
+  consecutive_dry_days_May -> grain_yield
+  heat_days_gt30_Jun -> grain_yield
+  gdd_base5_Apr -> plant_N
+  gdd_base5_Apr -> plant_phosphate
+}')
+
+adjustmentSets(
+  fert_dag,
+  exposure = "fertilizer_N",
+  outcome = "grain_yield",
+  effect = "total"
+)
+```
+
+## Draft interpretation template
+
+> The simplified DAG was used to clarify which variables are upstream confounders, which are mediators, and which should not be adjusted for when estimating total effects. The output from `dagitty` should be interpreted only relative to the assumed DAG. If the DAG is misspecified or important variables are unmeasured, the adjustment recommendation may not identify a causal effect.
+
+# Final synthesis draft
+
+Replace this section after the analysis is complete.
+
+> This notebook used the causal DAG to move beyond pure yield prediction and ask mechanistic questions about nutrient conversion. The main analysis focused on whether phosphate availability modifies the relationship between soil nitrogen and plant nitrogen. The linear interaction model provided an interpretable first approximation, while the Random Forest dependency plots explored nonlinear or threshold-like uptake patterns. The secondary drought analysis asked whether dry conditions weaken nutrient uptake. Together, these analyses suggest that \[insert main finding\].
+>
+> For the overall project, these mechanism analyses help explain why yield prediction may require nonlinear models or interaction terms. At the same time, the small number of observations and strong correlation among nutrient variables limit the strength of causal conclusions. Therefore, the final interpretation should distinguish clearly between predictive usefulness, mechanistic plausibility, and causal evidence.
+
+# Final checklist
+
+Before rendering this notebook, verify:
+
+- [ ] variable names match the dataset exactly;
+- [ ] `year` is available and correctly encoded;
+- [ ] no downstream variables are included in mechanism models;
+- [ ] RF dependency plots are interpreted as associational, not causal;
+- [ ] linear and RF results are compared qualitatively, not overclaimed;
+- [ ] optional yield and `dagitty` sections are clearly marked as extensions.

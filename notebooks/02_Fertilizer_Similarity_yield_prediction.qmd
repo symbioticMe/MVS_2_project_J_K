@@ -1,0 +1,316 @@
+---
+title: "02 — Fertilizer similarity and data limitations"
+subtitle: "Comparing fertilizer effects on grain yield under year/weather variation and small-sample uncertainty"
+author: "Project team"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  eval: false
+  echo: true
+  warning: false
+  message: false
+---
+
+# Purpose of this notebook
+
+This notebook investigates whether different fertilizers have distinguishable effects on final grain yield.
+
+The central scientific question is:
+
+> **Do different fertilizers produce similar or distinguishable effects on grain yield?**
+
+This is deliberately framed as a **similarity and uncertainty** question, not only as a hypothesis test for differences.
+
+Because the dataset contains only a limited number of observations, the goal is not to produce a definitive fertilizer ranking. Instead, this notebook asks:
+
+1. Are fertilizer differences visible in the raw data?
+2. Are fertilizer differences stable across years?
+3. Do estimated fertilizer effects remain after adjusting for year and weather?
+4. Which fertilizers appear similar within the uncertainty of the data?
+5. Where does the dataset reach its inferential limit?
+
+# Relationship to other notebooks
+
+This notebook builds directly on Notebook 1.
+
+Notebook 1 identified:
+
+- yield variation across fertilizers,
+- year-to-year variability,
+- possible weather effects,
+- multicollinearity among nutrient variables,
+- small-sample limitations.
+
+This notebook focuses specifically on fertilizer-level differences in grain yield.
+
+Outputs from this notebook will inform:
+
+- Notebook 3: whether fertilizer identity should be included as a predictor in yield models;
+- Notebook 4: how fertilizer effects should be interpreted causally and mechanistically.
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(broom)
+library(emmeans)
+library(performance)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+```
+
+# Load data
+
+```{r}
+# Load cleaned dataset from Notebook 1
+
+dat <- readRDS("outputs/cleaned_data.rds")
+
+# Inspect structure
+str(dat)
+```
+
+# Basic preprocessing
+
+```{r}
+dat <- dat %>%
+  mutate(
+    fertilizer_type = as.factor(fertilizer_type),
+    year = as.factor(year)
+  )
+```
+
+# Variable groups
+
+```{r}
+weather_vars <- c(
+  "rain_total_mm_mar",
+  "rain_total_mm_apr",
+  "consecutive_dry_days_may",
+  "heat_days_gt30_may",
+  "heat_days_gt30_jun",
+  "gdd_base5_apr"
+)
+
+response_var <- "grain_yield"
+```
+
+# Exploratory fertilizer comparison
+
+## Observations per fertilizer and year
+
+Before fitting models, inspect whether the design is balanced.
+
+```{r}
+dat %>%
+  count(year, fertilizer_type) %>%
+  arrange(year, fertilizer_type)
+```
+
+```{r}
+dat %>%
+  count(fertilizer_type) %>%
+  ggplot(aes(x = fertilizer_type, y = n)) +
+  geom_col(fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Number of observations per fertilizer",
+    x = "Fertilizer",
+    y = "Number of observations"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Raw yield by fertilizer
+
+```{r}
+ggplot(dat, aes(x = fertilizer_type, y = grain_yield, color = fertilizer_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7, size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Raw grain yield by fertilizer",
+    subtitle = "Boxplots with individual replicate observations",
+    x = "Fertilizer",
+    y = "Grain yield"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+```
+
+## Mean yield and uncertainty by fertilizer
+
+```{r}
+fert_summary <- dat %>%
+  group_by(fertilizer_type) %>%
+  summarise(
+    n = n(),
+    mean_yield = mean(grain_yield, na.rm = TRUE),
+    sd_yield = sd(grain_yield, na.rm = TRUE),
+    se_yield = sd_yield / sqrt(n),
+    ci_low = mean_yield - qt(0.975, df = n - 1) * se_yield,
+    ci_high = mean_yield + qt(0.975, df = n - 1) * se_yield,
+    .groups = "drop"
+  )
+
+fert_summary
+```
+
+```{r}
+ggplot(fert_summary, aes(x = reorder(fertilizer_type, mean_yield), y = mean_yield)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.15) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Mean grain yield by fertilizer",
+    subtitle = "Error bars show approximate 95% confidence intervals",
+    x = "Fertilizer",
+    y = "Mean grain yield"
+  )
+```
+
+## Draft interpretation
+
+Replace after analysis.
+
+> The raw fertilizer comparison showed [clear / moderate / weak] separation between fertilizers. Several fertilizers had strongly overlapping yield distributions, suggesting that the data may not support a precise fertilizer ranking. This motivates model-based comparisons that adjust for year and weather while keeping uncertainty central.
+
+# Year dependence of fertilizer effects
+
+## Yield by year and fertilizer
+
+```{r}
+ggplot(dat, aes(x = fertilizer_type, y = grain_yield, color = fertilizer_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  facet_wrap(~ year) +
+  theme_minimal() +
+  labs(
+    title = "Grain yield by fertilizer within each year",
+    x = "Fertilizer",
+    y = "Grain yield"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+```
+
+## Fertilizer × year mean trends
+
+```{r}
+fert_year_summary <- dat %>%
+  group_by(year, fertilizer_type) %>%
+  summarise(
+    mean_yield = mean(grain_yield, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ ggplot(fert_year_summary, aes(x = year, y = mean_yield, group = fertilizer_type, color = fertilizer_type)) +
+  geom_line(alpha = 0.8) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Fertilizer-specific mean yield across years",
+    subtitle = "Crossing lines suggest fertilizer × year interaction or unstable ranking",
+    x = "Year",
+    y = "Mean grain yield"
+  )
+```
+
+## Draft interpretation
+
+> The year-wise plots showed that fertilizer ranking was [stable / unstable / partly stable] across years. If fertilizer lines cross strongly, this suggests that fertilizer effects may depend on environmental conditions or that the data are too noisy to rank fertilizers reliably.
+
+# Model 1: fertilizer-only model
+
+## Scientific question
+
+> Are there average yield differences between fertilizers, ignoring year and weather?
+
+This is a baseline descriptive model.
+
+```{r}
+mod_fert_only <- lm(grain_yield ~ fertilizer_type, data = dat)
+summary(mod_fert_only)
+anova(mod_fert_only)
+confint(mod_fert_only)
+```
+
+## Model diagnostics
+
+```{r}
+performance::check_model(mod_fert_only)
+```
+
+## Estimated marginal means
+
+```{r}
+emm_fert_only <- emmeans(mod_fert_only, ~ fertilizer_type)
+emm_fert_only
+```
+
+```{r}
+plot(emm_fert_only) +
+  labs(
+    title = "Estimated fertilizer means: fertilizer-only model",
+    x = "Estimated grain yield",
+    y = "Fertilizer"
+  )
+```
+
+## Pairwise contrasts
+
+```{r}
+contrast_fert_only <- pairs(emm_fert_only, adjust = "tukey")
+contrast_fert_only
+```
+
+```{r}
+contrast_fert_only_df <- broom::tidy(contrast_fert_only)
+contrast_fert_only_df
+```
+
+## Draft interpretation
+
+> In the fertilizer-only model, fertilizer type explained [little / moderate / substantial] variation in grain yield. However, because this model ignores year and weather, it should be interpreted as a descriptive comparison rather than an adjusted fertilizer effect estimate.
+
+# Model 2: year-adjusted fertilizer model
+
+## Scientific question
+
+> Do fertilizer differences remain after accounting for year-to-year variation?
+
+Year adjustment is important because the dataset contains observations from five years, and weather/environmental differences may strongly affect yield.
+
+```{r}
+mod_fert_year <- lm(grain_yield ~ fertilizer_type + year, data = dat)
+summary(mod_fert_year)
+anova(mod_fert_year)
+confint(mod_fert_year)
+```
+
+## Model diagnostics
+
+```{r}
+performance::check_model(mod_fert_year)
+```
+
+## Estimated fertilizer means adjusted for year
+
+```{r}
+emm_fert_year <- emmeans(mod_fert_year, ~ fertilizer_type)
+emm_fert_year
+```
+
+```{r}
+plot(emm_fert_year) +
+  labs(
+    title = "Estimated fertilizer means adjusted for year",
+    x = "Estimated grain yield",
+    y = "Fertilizer"
+  )
+``

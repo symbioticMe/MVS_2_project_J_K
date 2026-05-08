@@ -1,0 +1,564 @@
+---
+title: "01 — Exploratory data analysis and multivariate structure"
+subtitle: "Understanding nutrient pathways, fertilizer similarity, multicollinearity, and small-sample limitations"
+author: "Jelena Čuklina"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Purpose of this notebook
+
+This notebook performs exploratory data analysis (EDA) of the fertilizer, nutrient, weather, and yield dataset.
+
+The goals are:
+
+1. Understand the overall structure of the dataset.
+2. Identify major sources of variation.
+3. Explore whether fertilizers appear distinguishable.
+4. Investigate multicollinearity and nutrient redundancy.
+5. Detect patterns suggesting nonlinear relationships.
+6. Assess whether the dataset size is sufficient for stable inference.
+7. Inform the modeling strategy used in downstream notebooks.
+
+This notebook is especially important because the dataset is relatively small compared with the number of measured variables. Therefore, exploratory analyses are not only descriptive — they directly determine which models are scientifically and statistically reasonable.
+
+# Scientific background
+
+The project is motivated by the causal nutrient-flow DAG developed for the dataset.
+
+The DAG assumes directional nutrient pathways:
+
+```text
+fertilizer -> soil -> plant -> grain/yield
+```
+
+with additional interactions involving:
+
+- phosphate availability,
+- drought stress,
+- heat stress,
+- biomass formation,
+- harvest allocation.
+
+Because many variables are mechanistically linked, strong correlations and multicollinearity are expected.
+
+This notebook therefore focuses strongly on:
+
+- correlation structure,
+- dimensionality,
+- variable redundancy,
+- year effects,
+- fertilizer similarity.
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(corrplot)
+library(ggcorrplot)
+library(GGally)
+library(patchwork)
+library(FactoMineR)
+library(factoextra)
+library(reshape2)
+library(viridis)
+```
+
+# Load data
+
+```{r}
+# Adjust path as needed
+
+dat <- read.csv("data/fertilizer_data.csv") %>%
+  clean_names()
+
+# Inspect structure
+str(dat)
+```
+
+# Dataset overview
+
+## Dimensions and variables
+
+```{r}
+dim(dat)
+colnames(dat)
+```
+
+## Missing values
+
+```{r}
+missing_summary <- dat %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+
+missing_summary
+```
+
+## Missingness visualization
+
+```{r}
+missing_plot <- dat %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "variable", values_to = "value") %>%
+  mutate(is_missing = is.na(value))
+
+ggplot(missing_plot, aes(x = variable, y = row_id, fill = is_missing)) +
+  geom_tile() +
+  scale_fill_manual(values = c("FALSE" = "grey90", "TRUE" = "red")) +
+  theme_minimal() +
+  labs(
+    title = "Missingness map",
+    x = "Variable",
+    y = "Observation"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## Summary statistics
+
+```{r}
+skim(dat)
+```
+
+# Experimental structure
+
+## Replicate structure
+
+```{r}
+dat %>%
+  count(year, fertilizer_type)
+```
+
+## Observations per year
+
+```{r}
+ggplot(dat, aes(x = as.factor(year))) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Observations per year",
+    x = "Year",
+    y = "Count"
+  )
+```
+
+## Observations per fertilizer
+
+```{r}
+ggplot(dat, aes(x = fertilizer_type)) +
+  geom_bar(fill = "darkgreen") +
+  theme_minimal() +
+  labs(
+    title = "Observations per fertilizer",
+    x = "Fertilizer",
+    y = "Count"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Initial yield exploration
+
+## Grain yield distribution
+
+```{r}
+ggplot(dat, aes(x = grain_yield)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of grain yield"
+  )
+```
+
+## Yield by fertilizer
+
+```{r}
+ggplot(dat, aes(x = fertilizer_type, y = grain_yield, color = fertilizer_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "Grain yield by fertilizer",
+    x = "Fertilizer",
+    y = "Grain yield"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Yield by year
+
+```{r}
+ggplot(dat, aes(x = as.factor(year), y = grain_yield, fill = as.factor(year))) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Grain yield by year",
+    x = "Year",
+    y = "Grain yield"
+  )
+```
+
+## Fertilizer × year interaction plot
+
+```{r}
+dat %>%
+  group_by(year, fertilizer_type) %>%
+  summarise(mean_yield = mean(grain_yield, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = year, y = mean_yield, color = fertilizer_type)) +
+  geom_line() +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Fertilizer × year interaction",
+    y = "Mean grain yield"
+  )
+```
+
+# Nutrient variable groups
+
+```{r}
+fertilizer_vars <- c(
+  "fertilizer_n",
+  "fertilizer_phosphate",
+  "fertilizer_k",
+  "fertilizer_ca",
+  "fertilizer_mg"
+)
+
+soil_vars <- c(
+  "soil_n",
+  "soil_phosphate",
+  "soil_k",
+  "soil_ca",
+  "soil_mg"
+)
+
+plant_vars <- c(
+  "plant_n",
+  "plant_phosphate",
+  "plant_k",
+  "plant_ca",
+  "plant_mg"
+)
+
+weather_vars <- c(
+  "rain_total_mm_mar",
+  "rain_total_mm_apr",
+  "consecutive_dry_days_may",
+  "heat_days_gt30_may",
+  "heat_days_gt30_jun",
+  "gdd_base5_apr"
+)
+
+response_vars <- c(
+  "total_biomass",
+  "harvest_index",
+  "grain_yield"
+)
+```
+
+# Correlation structure
+
+## Correlation matrix
+
+We expect strong correlation blocks because the DAG encodes directional nutrient pathways and nutrient interactions.
+
+Examples:
+
+```text
+fertilizer_N -> soil_N -> plant_N
+plant_phosphate -> plant_N
+```
+
+Strong correlations are therefore biologically meaningful rather than accidental.
+
+```{r}
+cor_vars <- c(
+  fertilizer_vars,
+  soil_vars,
+  plant_vars,
+  weather_vars,
+  response_vars
+)
+
+cor_dat <- dat %>%
+  select(all_of(cor_vars)) %>%
+  select(where(is.numeric))
+
+cor_mat <- cor(cor_dat, use = "pairwise.complete.obs")
+
+round(cor_mat, 2)
+```
+
+## Correlation heatmap
+
+```{r}
+ggcorrplot(
+  cor_mat,
+  hc.order = TRUE,
+  type = "lower",
+  lab = FALSE,
+  colors = c("darkred", "white", "darkblue")
+) +
+  labs(title = "Correlation heatmap")
+```
+
+## Interpretation draft
+
+Replace after analysis.
+
+> The correlation heatmap showed strong correlation blocks among nutrient variables, especially along the fertilizer–soil–plant pathways. This suggests substantial multicollinearity, which is expected biologically but problematic for ordinary linear regression. Therefore, downstream notebooks will use Ridge regression, Lasso regression, and Random Forest models to address instability and nonlinear structure.
+
+# Pairwise exploratory relationships
+
+## Scatterplot matrix
+
+Select only the most important variables to keep the plot readable.
+
+```{r}
+pair_vars <- dat %>%
+  select(
+    grain_yield,
+    total_biomass,
+    plant_n,
+    plant_phosphate,
+    soil_n,
+    soil_phosphate,
+    consecutive_dry_days_may,
+    heat_days_gt30_jun
+  )
+
+GGally::ggpairs(pair_vars)
+```
+
+## Interpretation draft
+
+> Several variable relationships appeared approximately linear, but others suggested threshold-like or saturating behavior. In particular, relationships involving drought and nutrient variables showed potential nonlinearities. This motivated the inclusion of Random Forest models and dependency plots in downstream notebooks.
+
+# PCA — dimensionality and nutrient structure
+
+## Motivation
+
+The dataset contains many correlated nutrient variables relative to the number of observations.
+
+PCA is used to:
+
+- understand dominant variance directions,
+- detect redundancy,
+- visualize fertilizer similarity,
+- explore whether year effects dominate,
+- investigate whether nutrients form coherent gradients.
+
+## Prepare PCA data
+
+```{r}
+pca_vars <- c(
+  fertilizer_vars,
+  soil_vars,
+  plant_vars
+)
+
+pca_dat <- dat %>%
+  select(all_of(pca_vars)) %>%
+  drop_na()
+
+pca_scaled <- scale(pca_dat)
+```
+
+## Run PCA
+
+```{r}
+pca_res <- prcomp(pca_scaled, center = TRUE, scale. = TRUE)
+
+summary(pca_res)
+```
+
+## Scree plot
+
+```{r}
+fviz_eig(pca_res)
+```
+
+## PCA scores
+
+```{r}
+pca_scores <- as.data.frame(pca_res$x)
+
+pca_scores$fertilizer_type <- dat$fertilizer_type[complete.cases(dat[, pca_vars])]
+pca_scores$year <- dat$year[complete.cases(dat[, pca_vars])]
+```
+
+## PCA colored by fertilizer
+
+```{r}
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = fertilizer_type)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "PCA of nutrient variables",
+    subtitle = "Colored by fertilizer"
+  )
+```
+
+## PCA colored by year
+
+```{r}
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = as.factor(year))) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "PCA of nutrient variables",
+    subtitle = "Colored by year"
+  )
+```
+
+## PCA loadings
+
+```{r}
+fviz_pca_var(pca_res,
+             col.var = "contrib",
+             gradient.cols = c("lightblue", "blue", "darkblue"),
+             repel = TRUE)
+```
+
+## Interpretation draft
+
+> PCA suggested that a relatively small number of latent nutrient gradients explained much of the variance in the dataset. If fertilizers separate clearly in PCA space, this indicates that nutrient compositions or uptake patterns differ systematically. If years separate strongly, this suggests environmental effects may dominate fertilizer effects. Strong loading overlap among nutrient variables further supports the presence of multicollinearity.
+
+# Scaling and preprocessing for downstream models
+
+## Why scaling matters
+
+Ridge and Lasso regression are sensitive to variable scale.
+
+Variables measured on very different scales can dominate the penalty terms if not standardized.
+
+Therefore, a scaled dataset is created for downstream prediction models.
+
+```{r}
+scaled_numeric <- dat %>%
+  select(where(is.numeric)) %>%
+  scale()
+
+scaled_numeric <- as.data.frame(scaled_numeric)
+```
+
+## Save outputs for downstream notebooks
+
+```{r}
+dir.create("outputs", showWarnings = FALSE)
+
+saveRDS(dat, "outputs/cleaned_data.rds")
+saveRDS(scaled_numeric, "outputs/scaled_data.rds")
+saveRDS(cor_mat, "outputs/correlation_matrix.rds")
+saveRDS(pca_res, "outputs/pca_results.rds")
+```
+
+# Preliminary conclusions and implications for downstream notebooks
+
+## Main observations
+
+Replace after analysis.
+
+> The exploratory analyses revealed:
+>
+> - strong correlations among nutrient variables;
+> - possible redundancy along fertilizer–soil–plant pathways;
+> - substantial overlap among some fertilizers;
+> - year-to-year variability that may compete with fertilizer effects;
+> - indications of nonlinear relationships involving drought and nutrient uptake;
+> - a potentially high-dimensional problem relative to the sample size.
+
+# How this notebook informs downstream analyses
+
+## Notebook 2 — Fertilizer similarity and data limits
+
+This notebook informs Notebook 2 by:
+
+- identifying whether fertilizer effects appear visually separable;
+- showing whether year effects are large enough to require adjustment;
+- indicating whether uncertainty is likely to dominate pairwise fertilizer comparisons.
+
+If fertilizers overlap strongly in PCA space or yield distributions, Notebook 2 will emphasize uncertainty and effect overlap rather than strong ranking claims.
+
+# Notebook 3 — Prediction, Ridge/Lasso, and Random Forest
+
+This notebook directly motivates the predictive modeling strategy.
+
+## Correlation structure -> Ridge/Lasso
+
+Strong nutrient correlations imply that ordinary least squares regression may produce unstable coefficients.
+
+Therefore:
+
+- Ridge regression will be used to stabilize correlated effects;
+- Lasso regression will be used cautiously for sparse feature selection.
+
+## Nonlinear exploratory patterns -> Random Forest
+
+If scatterplots or dependency patterns suggest thresholds, saturation, or interactions, Random Forest models become scientifically justified.
+
+In particular:
+
+- drought effects may be nonlinear;
+- nutrient uptake may involve interaction thresholds;
+- Random Forest dependency plots may reveal relationships not captured by linear models.
+
+## PCA -> dimensionality understanding
+
+PCA helps interpret whether the data effectively contain only a few dominant nutrient gradients.
+
+This informs:
+
+- interpretation of feature-selection instability;
+- expectations for predictive performance;
+- interpretation of latent nutrient structure.
+
+# Notebook 4 — Causal DAG mechanisms and synthesis
+
+This notebook provides the exploratory basis for the causal-mechanism notebook.
+
+## Correlation pathways support DAG plausibility
+
+Observed nutrient correlation structure can support or challenge parts of the assumed DAG.
+
+For example:
+
+- strong soil_N -> plant_N association;
+- phosphate correlations with nitrogen uptake;
+- weather correlations with plant nutrient variables.
+
+## Nonlinear signals motivate RF mechanism exploration
+
+If EDA suggests nonlinear drought or nutrient effects, Notebook 4 will compare:
+
+- interpretable linear interaction models;
+- Random Forest dependency plots.
+
+## Data limitations constrain causal claims
+
+The EDA also defines the limits of inference.
+
+If:
+
+- predictors are highly correlated,
+- sample size is small,
+- year effects dominate,
+
+then downstream notebooks will interpret causal findings cautiously and frame them as DAG-guided mechanistic hypotheses rather than definitive causal estimates.
+
+# Final project-level interpretation draft
+
+Replace after all notebooks are complete.
+
+> The exploratory analysis showed that the dataset contains rich multivariate structure but also substantial inferential challenges. Nutrient variables form strongly correlated blocks consistent with the assumed causal nutrient-flow pathways. At the same time, the relatively small sample size and overlapping fertilizer patterns suggest that coefficient instability and uncertainty will be important limitations. These observations motivated the use of shrinkage methods, Random Forest models, dependency plots, and DAG-guided interpretation in subsequent notebooks.

@@ -1,0 +1,437 @@
+---
+title: "Zurich weather covariates from covariate dictionary"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  warning: false
+  message: false
+---
+
+This Quarto document reads `weather_covariate_dictionary_updated.xlsx` and calculates the listed weather covariates for **Zurich only**.
+
+The main function calculates covariates for **one specific calendar month only**. A second wrapper function then calculates a full season by calling the monthly function month by month and selecting only the covariates listed for each month in the Excel dictionary.
+
+For a `target_year`, the season is defined as:
+
+- October--December from `target_year - 1`
+- January--June from `target_year`
+
+For example, the **2022 season** is October--December 2021 plus January--June 2022.
+
+## Important GDD note
+
+If `gdd_base5` returned `NA` before, the likely issue was a mismatch between the dictionary formula and the prepared daily weather table:
+
+- the dictionary formula uses `daily_tmax` and `daily_tmin`
+- the prepared daily table used derived names such as `daily_max_temp_c` and `daily_min_temp_c`
+
+This version keeps the descriptive names **and** adds aliases `daily_tmax` and `daily_tmin` before calculating GDD, so the dictionary formula can be followed closely.
+
+```{r}
+#| label: setup
+
+# Required packages:
+# install.packages(c(
+#   "readxl", "dplyr", "tidyr", "lubridate", "purrr",
+#   "stringr", "slider", "jsonlite", "httr2", "tibble", "readr"
+# ))
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(purrr)
+library(stringr)
+library(slider)
+library(jsonlite)
+library(httr2)
+library(tibble)
+library(readr)
+```
+
+```{r}
+#| label: function-monthly-weather-covariates
+
+max_consecutive_true <- function(x) {
+  x <- tidyr::replace_na(as.logical(x), FALSE)
+  if (!any(x)) return(0L)
+  r <- rle(x)
+  max(r$lengths[r$values])
+}
+
+read_weather_dictionary <- function(dictionary_path = "weather_covariate_dictionary_updated.xlsx") {
+  month_lookup <- tibble(
+    month = month.abb,
+    month_num = seq_along(month.abb)
+  )
+
+  readxl::read_excel(dictionary_path) |>
+    filter(!if_all(everything(), is.na)) |>
+    mutate(
+      month = str_to_title(as.character(month)),
+      month = str_sub(month, 1, 3)
+    ) |>
+    left_join(month_lookup, by = "month") |>
+    filter(!is.na(month_num))
+}
+
+fetch_open_meteo_hourly <- function(latitude,
+                                    longitude,
+                                    start_date,
+                                    end_date,
+                                    timezone = "Europe/Zurich") {
+  # Open-Meteo Historical Weather API.
+  # Dictionary variable mapping:
+  # - hourly_precip_mm := Open-Meteo hourly precipitation, mm
+  # - hourly_temp_c    := Open-Meteo hourly temperature_2m, deg C
+  request("https://archive-api.open-meteo.com/v1/archive") |>
+    req_url_query(
+      latitude = latitude,
+      longitude = longitude,
+      start_date = as.character(start_date),
+      end_date = as.character(end_date),
+      hourly = "temperature_2m,precipitation",
+      timezone = timezone,
+      temperature_unit = "celsius",
+      precipitation_unit = "mm"
+    ) |>
+    req_perform() |>
+    resp_body_json(simplifyVector = TRUE)
+}
+
+prepare_hourly_daily_weather <- function(api_response, timezone = "Europe/Zurich") {
+  hourly <- tibble(
+    datetime = ymd_hm(api_response$hourly$time, tz = timezone),
+    date = as.Date(datetime),
+    hourly_temp_c = as.numeric(api_response$hourly$temperature_2m),
+    hourly_precip_mm = as.numeric(api_response$hourly$precipitation)
+  )
+
+  daily <- hourly |>
+    group_by(date) |>
+    summarise(
+      # Derived from hourly data because Open-Meteo is requested hourly here.
+      daily_precip_mm = sum(hourly_precip_mm, na.rm = TRUE),
+      daily_min_temp_c = min(hourly_temp_c, na.rm = TRUE),
+      daily_max_temp_c = max(hourly_temp_c, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      # Aliases used by the Excel dictionary formula for GDD.
+      # This fixes the common NA/missing-object issue when formula text uses
+      # daily_tmax/daily_tmin but the prepared table uses longer variable names.
+      daily_tmin = daily_min_temp_c,
+      daily_tmax = daily_max_temp_c
+    )
+
+  list(hourly = hourly, daily = daily)
+}
+
+calculate_one_covariate <- function(variable_name,
+                                    calculation_from_hourly_data,
+                                    hourly_m,
+                                    daily_m) {
+  # This function follows calculation_from_hourly_data as closely as possible.
+  # It uses explicit branches for safety rather than eval(parse()).
+  formula_txt <- str_squish(as.character(calculation_from_hourly_data))
+
+  if (variable_name == "rain_total_mm" || formula_txt == "sum(hourly_precip_mm)") {
+    return(sum(hourly_m$hourly_precip_mm, na.rm = TRUE))
+  }
+
+  if (variable_name == "consecutive_dry_days" || str_detect(formula_txt, "daily_precip_mm < 1")) {
+    return(max_consecutive_true(daily_m$daily_precip_mm < 1))
+  }
+
+  if (variable_name == "heavy_rain_days_20mm" || str_detect(formula_txt, "daily_precip_mm > 20")) {
+    return(sum(daily_m$daily_precip_mm > 20, na.rm = TRUE))
+  }
+
+  if (variable_name == "max_3day_rain_mm" || str_detect(formula_txt, "rollsum\\(daily_precip_mm, 3\\)")) {
+    x <- daily_m$daily_precip_mm
+    if (length(x) < 3) return(NA_real_)
+    rolling_3day <- slider::slide_dbl(x, sum, .before = 2, .complete = TRUE, na.rm = TRUE)
+    return(max(rolling_3day, na.rm = TRUE))
+  }
+
+  if (variable_name == "temp_mean_c" || formula_txt == "mean(hourly_temp_c)") {
+    return(mean(hourly_m$hourly_temp_c, na.rm = TRUE))
+  }
+
+  if (variable_name == "heat_days_gt28" || str_detect(formula_txt, "daily_max_temp_c > 28")) {
+    return(sum(daily_m$daily_max_temp_c > 28, na.rm = TRUE))
+  }
+
+  if (variable_name == "heat_days_gt30" || str_detect(formula_txt, "daily_max_temp_c > 30")) {
+    return(sum(daily_m$daily_max_temp_c > 30, na.rm = TRUE))
+  }
+
+  if (variable_name == "gdd_base5" || str_detect(formula_txt, "daily_tmax") || str_detect(formula_txt, "daily_tmin")) {
+    # Dictionary: sum(pmax(((daily_tmax + daily_tmin)/2) - 5, 0))
+    # Open-Meteo does not directly return daily_tmax/daily_tmin in this script;
+    # they are derived from hourly temperature_2m and stored as aliases above.
+    return(sum(
+      pmax(((daily_m$daily_tmax + daily_m$daily_tmin) / 2) - 5, 0),
+      na.rm = TRUE
+    ))
+  }
+
+  if (variable_name == "frost_days_lt0" || str_detect(formula_txt, "daily_min_temp_c < 0")) {
+    return(sum(daily_m$daily_min_temp_c < 0, na.rm = TRUE))
+  }
+
+  if (variable_name == "diurnal_temp_range" || str_detect(formula_txt, "daily_max_temp_c - daily_min_temp_c")) {
+    return(mean(daily_m$daily_max_temp_c - daily_m$daily_min_temp_c, na.rm = TRUE))
+  }
+
+  warning("No calculation rule implemented for variable_name = ", variable_name)
+  NA_real_
+}
+
+extract_zurich_weather_covariates_one_month <- function(calendar_year,
+                                                        month_num,
+                                                        dictionary_path = "weather_covariate_dictionary_updated.xlsx",
+                                                        latitude = 47.3769,
+                                                        longitude = 8.5417,
+                                                        timezone = "Europe/Zurich") {
+  stopifnot(length(calendar_year) == 1, length(month_num) == 1)
+  stopifnot(month_num >= 1, month_num <= 12)
+
+  start_date <- as.Date(sprintf("%d-%02d-01", calendar_year, month_num))
+  end_date <- start_date + lubridate::days(lubridate::days_in_month(start_date) - 1L)
+  days_in_selected_month <- as.integer(lubridate::days_in_month(start_date))
+
+  dict <- read_weather_dictionary(dictionary_path) |>
+    filter(month_num == !!month_num)
+
+  if (nrow(dict) == 0) {
+    warning("No dictionary covariates listed for ", month.abb[month_num], " ", calendar_year)
+    return(tibble())
+  }
+
+  raw <- fetch_open_meteo_hourly(
+    latitude = latitude,
+    longitude = longitude,
+    start_date = start_date,
+    end_date = end_date,
+    timezone = timezone
+  )
+
+  weather <- prepare_hourly_daily_weather(raw, timezone = timezone)
+
+  hourly_m <- weather$hourly |>
+    filter(date >= start_date, date <= end_date)
+
+  daily_m <- weather$daily |>
+    filter(date >= start_date, date <= end_date)
+
+  if (nrow(hourly_m) == 0 || nrow(daily_m) == 0) {
+    warning("No weather data returned for ", month.abb[month_num], " ", calendar_year)
+  }
+
+  dict |>
+    mutate(
+      location = "Zurich",
+      latitude = latitude,
+      longitude = longitude,
+      calendar_year = calendar_year,
+      month_num = month_num,
+      start_date = start_date,
+      end_date = end_date,
+      days_in_month = days_in_selected_month,
+      observed_days = n_distinct(daily_m$date),
+      observed_hours = nrow(hourly_m),
+      value = pmap_dbl(
+        list(variable_name, calculation_from_hourly_data),
+        \(v, f) calculate_one_covariate(v, f, hourly_m, daily_m)
+      ),
+      covariate_id = paste(variable_name, tolower(month), calendar_year, sep = "_")
+    ) |>
+    select(
+      location,
+      latitude,
+      longitude,
+      calendar_year,
+      month,
+      month_num,
+      start_date,
+      end_date,
+      days_in_month,
+      observed_days,
+      observed_hours,
+      variable_name,
+      covariate_id,
+      group,
+      unit,
+      aggregation_level,
+      definition,
+      calculation_from_hourly_data,
+      value,
+      priority,
+      main_responses
+    ) |>
+    arrange(group, variable_name)
+}
+```
+
+```{r}
+#| label: function-period-weather-covariates
+
+season_month_calendar <- function(target_year,
+                                  months_previous_year = 10:12,
+                                  months_target_year = 1:6) {
+  bind_rows(
+    tibble(calendar_year = target_year - 1L, month_num = months_previous_year),
+    tibble(calendar_year = target_year, month_num = months_target_year)
+  ) |>
+    distinct(calendar_year, month_num) |>
+    arrange(calendar_year, month_num)
+}
+
+extract_zurich_weather_covariates_period <- function(target_year,
+                                                     dictionary_path = "weather_covariate_dictionary_updated.xlsx",
+                                                     latitude = 47.3769,
+                                                     longitude = 8.5417,
+                                                     timezone = "Europe/Zurich",
+                                                     months_previous_year = 10:12,
+                                                     months_target_year = 1:6) {
+  months_to_calculate <- season_month_calendar(
+    target_year = target_year,
+    months_previous_year = months_previous_year,
+    months_target_year = months_target_year
+  )
+
+  covariates_long <- pmap_dfr(
+    months_to_calculate,
+    \(calendar_year, month_num) {
+      extract_zurich_weather_covariates_one_month(
+        calendar_year = calendar_year,
+        month_num = month_num,
+        dictionary_path = dictionary_path,
+        latitude = latitude,
+        longitude = longitude,
+        timezone = timezone
+      )
+    }
+  ) |>
+    mutate(season_target_year = target_year, .before = calendar_year) |>
+    arrange(calendar_year, month_num, group, variable_name)
+
+  # For the season-level wide table, keep the season target year as its own
+  # metadata column, but do not include the calendar year in each covariate
+  # column name. Example: rain_total_mm_oct instead of
+  # rain_total_mm_oct_2021. This is safe for one Oct--Jun season because each
+  # month appears only once within a season.
+  covariates_wide <- covariates_long |>
+    mutate(covariate_id_wide = paste(variable_name, tolower(month), sep = "_")) |>
+    select(location, season_target_year, covariate_id_wide, value) |>
+    pivot_wider(names_from = covariate_id_wide, values_from = value)
+
+  list(
+    covariates_long = covariates_long,
+    covariates_wide = covariates_wide,
+    months_calculated = months_to_calculate,
+    source = "Open-Meteo Historical Weather API: https://open-meteo.com/en/docs/historical-weather-api"
+  )
+}
+```
+
+```{r}
+#| label: monthly-examples
+
+# Single-month checks. These are useful for validating that the function is
+# filtering weather data to exactly one calendar month.
+
+zurich_october_2021 <- extract_zurich_weather_covariates_one_month(
+  calendar_year = 2021,
+  month_num = 10,
+  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+)
+
+zurich_february_2020 <- extract_zurich_weather_covariates_one_month(
+  calendar_year = 2020,
+  month_num = 2,
+  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+)
+
+zurich_february_2022 <- extract_zurich_weather_covariates_one_month(
+  calendar_year = 2022,
+  month_num = 2,
+  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+)
+
+zurich_april_2022 <- extract_zurich_weather_covariates_one_month(
+  calendar_year = 2022,
+  month_num = 4,
+  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+)
+
+zurich_october_2021
+zurich_february_2020
+zurich_february_2022
+zurich_april_2022
+
+readr::write_csv(zurich_october_2021, "zurich_weather_covariates_october_2021.csv")
+readr::write_csv(zurich_february_2020, "zurich_weather_covariates_february_2020.csv")
+readr::write_csv(zurich_february_2022, "zurich_weather_covariates_february_2022.csv")
+readr::write_csv(zurich_april_2022, "zurich_weather_covariates_april_2022.csv")
+```
+
+```{r}
+#| label: zurich-2022-season
+
+# The 2022 season starts in October 2021 and continues through June 2022.
+# The period function calls the one-month function month by month and, for each
+# month, selects only the covariates listed for that month in the Excel dictionary.
+
+zurich_2022_season <- extract_zurich_weather_covariates_period(
+  target_year = 2022,
+  dictionary_path = "weather_covariate_dictionary_updated.xlsx",
+  months_previous_year = 10:12,
+  months_target_year = 1:6
+)
+
+zurich_2022_season$covariates_long
+zurich_2022_season$covariates_wide
+
+# Save both long and wide forms.
+readr::write_csv(
+  zurich_2022_season$covariates_long,
+  "zurich_weather_covariates_2022_season_long.csv"
+)
+
+readr::write_csv(
+  zurich_2022_season$covariates_wide,
+  "zurich_weather_covariates_2022_season_wide.csv"
+)
+
+# GDD diagnostic: should no longer be NA unless source data for April is missing.
+zurich_2022_season$covariates_long |>
+  filter(variable_name == "gdd_base5") |>
+  select(calendar_year, month, days_in_month, observed_days, observed_hours,
+         variable_name, calculation_from_hourly_data, value)
+```
+
+```{r}
+#| label: zurich-years-1995-2022
+years <- 1995:2022
+years_weather <- list()
+for (year in years) {
+  this_year <- extract_zurich_weather_covariates_period(
+    target_year = year,
+    dictionary_path = "weather_covariate_dictionary_updated.xlsx",
+    months_previous_year = 10:12,
+    months_target_year = 1:6
+  )
+  years_weather[[as.character(year)]] <- this_year$covariates_wide
+}
+df_years <- do.call(rbind, years_weather)
+```
+```{r}
+readr::write_csv(
+  df_years,
+  "zurich_weather_covariates_1995_2022_seasons.csv"
+)
+```
