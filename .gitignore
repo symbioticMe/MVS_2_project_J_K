@@ -18,6 +18,8 @@ data/*
 # rendered reports
 *.html
 *.pdf
+*.docx
+*.pptx
 
 # Outputs
 outputs/figures/*
