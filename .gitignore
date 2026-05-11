@@ -11,7 +11,9 @@ renv/staging/
 
 # Data files (keep structure, avoid committing sensitive/raw bulk files)
 data/raw/*
+data/*
 !data/raw/.gitkeep
+!data/.gitkeep
 
 # rendered reports
 *.html
