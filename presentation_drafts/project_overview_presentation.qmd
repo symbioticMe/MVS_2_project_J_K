@@ -1,0 +1,296 @@
+---
+title: "Multivariate modeling of nutrient-flow mechanisms and yield formation"
+subtitle: "Project overview and presentation draft"
+format:
+  pptx:
+    slide-level: 2
+---
+
+# Project motivation
+
+## Dataset
+
+- Fertilizer composition variables
+- Soil nutrient measurements
+- Plant nutrient measurements
+- Grain nutrient measurements
+- Weather variables
+- Biomass and harvest indicators
+- Final grain yield
+
+## Main challenge
+
+- Small number of observations
+- Many correlated variables
+- Strong mechanistic dependencies
+
+---
+
+# Scientific background
+
+## Nutrient-flow DAG
+
+```text
+fertilizer -> soil -> plant -> grain/yield
+```
+
+Additional interactions:
+
+- phosphate availability
+- drought stress
+- heat stress
+- biomass formation
+- harvest allocation
+
+## Main themes
+
+- multicollinearity
+- nonlinear effects
+- prediction vs causality
+- inferential limits
+
+---
+
+# Main scientific questions
+
+## Q1 — Yield prediction
+
+Which variables best predict grain yield?
+
+Models:
+
+- Linear regression
+- Ridge regression
+- Lasso regression
+- Random Forest
+
+Focus:
+
+- prediction performance
+- feature stability
+- nonlinear effects
+
+---
+
+# Main scientific questions
+
+## Q2 — Fertilizer similarity
+
+Do fertilizers produce distinguishable effects on grain yield?
+
+Main goals:
+
+- compare fertilizer effects
+- evaluate uncertainty
+- investigate overlap of effects
+
+---
+
+# Main scientific questions
+
+## Q3 — Phosphate-dependent nitrogen uptake
+
+Does soil nitrogen translate into plant nitrogen more strongly when phosphate availability is sufficient?
+
+Main approaches:
+
+- linear interaction models
+- Random Forest dependency plots
+
+---
+
+# Main scientific questions
+
+## Q4 — Drought-dependent nutrient uptake
+
+Does drought weaken nutrient uptake or nutrient conversion?
+
+Main focus:
+
+- drought–nutrient interactions
+- nonlinear weather effects
+
+---
+
+# Methodological philosophy
+
+| Goal | Methods |
+|---|---|
+| Exploratory structure | Correlation analysis, PCA |
+| Fertilizer comparison | Linear models |
+| Prediction | Ridge, Lasso, RF |
+| Mechanism exploration | Interaction models + RF |
+| Causal interpretation | DAG reasoning |
+| Honest evaluation | Cross-validation |
+
+---
+
+# Notebook 1 — EDA and multivariate structure
+
+## Goals
+
+- understand data structure
+- explore fertilizer/year variability
+- detect multicollinearity
+- identify nonlinear patterns
+
+## Analyses
+
+- missingness
+- yield distributions
+- correlation heatmaps
+- scatterplots
+- PCA
+
+---
+
+# Notebook 1 — Expected outcomes
+
+## Main findings
+
+- strong nutrient correlation blocks
+- evidence for multicollinearity
+- possible nonlinear effects
+- fertilizer overlap
+
+## Impact downstream
+
+- motivates Ridge/Lasso
+- motivates RF
+- informs causal interpretation
+
+---
+
+# Notebook 2 — Fertilizer similarity and data limits
+
+## Goals
+
+Determine whether fertilizers are distinguishable.
+
+## Analyses
+
+- yield ~ fertilizer
+- year-adjusted models
+- weather-adjusted models
+- pairwise contrasts
+
+---
+
+# Notebook 2 — Main interpretation
+
+Expected themes:
+
+- overlapping fertilizer effects
+- uncertainty dominates some contrasts
+- weather/year effects may exceed fertilizer effects
+
+---
+
+# Notebook 3 — Prediction and Random Forest
+
+## Main models
+
+- Linear regression
+- Ridge regression
+- Lasso regression
+- Random Forest
+
+## Validation
+
+- LOOCV or repeated k-fold CV
+
+---
+
+# Notebook 3 — Random Forest role
+
+## Why RF?
+
+Expected nonlinearities:
+
+- drought thresholds
+- nutrient saturation
+- interactions
+
+## RF outputs
+
+- variable importance
+- dependency plots
+- interaction surfaces
+
+---
+
+# Notebook 4 — Causal DAG mechanisms
+
+## Main mechanistic question
+
+Does phosphate availability modify nitrogen uptake?
+
+Main models:
+
+```text
+plant_N ~ soil_N * soil_phosphate + weather + year
+```
+
+and Random Forest analogues.
+
+---
+
+# Notebook 4 — Secondary mechanistic question
+
+## Drought-dependent uptake
+
+Example model:
+
+```text
+plant_N ~ soil_N * dryMay + weather + year
+```
+
+Goal:
+
+- understand weather-modified uptake
+
+---
+
+# Causal interpretation strategy
+
+## Main principles
+
+- distinguish confounders from mediators
+- prediction ≠ causality
+- RF dependency plots are associational
+- DAG guides interpretation
+
+---
+
+# Expected limitations
+
+## Statistical limitations
+
+- small sample size
+- strong multicollinearity
+- observational data
+- only five years
+
+## Consequences
+
+- coefficient instability
+- uncertain feature selection
+- limited causal identification
+
+---
+
+# Expected contributions
+
+## Scientific contribution
+
+The project combines:
+
+- multivariate exploratory analysis
+- shrinkage methods
+- nonlinear ML
+- DAG-guided mechanism exploration
+- explicit discussion of inferential limits
+
+## Central message
+
+Understanding where the dataset supports reliable conclusions is itself part of the scientific contribution.
