@@ -1,0 +1,1023 @@
+---
+title: "EDA: Fertilizer treatments and winter wheat biomass"
+subtitle: "Data structure, treatment rankings, and year-to-year variability"
+author: "Jelena Čuklina"
+format:
+  pptx:
+    slide-level: 2
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Project question
+
+**Main EDA question**
+
+What are properties of ZOFE Winter wheat dataset, that are necessary to highlight for interpretation of other method outputs?
+
+**Role of this notebook**
+
+This presentation complements notebooks with the causal DAG/SEM and predictive regression modeling with Random Forest and Linear models by showing the empirical structure.
+
+---
+
+```{r}
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(forcats)
+library(knitr)
+library(scales)
+library(RColorBrewer)
+
+resolve_repo_path <- function(...) {
+  candidates <- c(".", "..")
+
+  for (base in candidates) {
+    candidate <- file.path(base, ...)
+    if (file.exists(candidate) || dir.exists(candidate)) {
+      return(candidate)
+    }
+  }
+
+  file.path(candidates[[1]], ...)
+}
+
+ww_data_path <- resolve_repo_path("data", "processed", "zofe_ww.csv")
+prep_script_path <- resolve_repo_path("src", "ZOFE_MVStat2_data_preparation.R")
+
+if (!file.exists(ww_data_path)) {
+  source(prep_script_path)
+}
+
+ZOFE_WW <- read_csv(ww_data_path, show_col_types = FALSE)
+
+theme_set(theme_bw())
+
+format_corr_label <- function(data, x_var, y_var) {
+  corr_value <- suppressWarnings(cor(data[[x_var]], data[[y_var]], use = "pairwise.complete.obs"))
+  paste0("r = ", round(corr_value, 2))
+}
+```
+
+---
+
+## Treatment-to-color mapping
+
+Centralized treatment colors are defined here so they can be modified once and reused across all plots.
+
+```{r}
+# Qualitative categorical palette from RColorBrewer.
+# Set3 is designed for categorical group distinctions and works well in presentations.
+observed_treatments <- sort(unique(ZOFE_WW$treatment_en))
+
+n_treatments <- length(observed_treatments)
+
+if (n_treatments <= 12) {
+  palette_values <- brewer.pal(max(3, n_treatments), "Set3")[1:n_treatments]
+} else {
+  palette_values <- colorRampPalette(
+    brewer.pal(12, "Set3")
+  )(n_treatments)
+}
+
+treatment_colors <- setNames(
+  palette_values,
+  observed_treatments
+)
+
+year_values <- sort(unique(ZOFE_WW$year))
+year_shapes <- setNames(
+  rep(c(0:14, 16:25), length.out = length(year_values)),
+  year_values
+)
+```
+
+---
+
+## Dataset structure
+
+```{r}
+data_structure <- tibble(
+  Quantity = c("Rows", "Columns", "Years", "Treatments", "Replicates", "Plots"),
+  Value = c(
+    nrow(ZOFE_WW),
+    ncol(ZOFE_WW),
+    n_distinct(ZOFE_WW$year),
+    n_distinct(ZOFE_WW$treatment_en),
+    n_distinct(ZOFE_WW$replicate),
+    n_distinct(ZOFE_WW$plot_nr)
+  )
+)
+
+kable(data_structure)
+```
+
+**Why this matters:** treatment comparisons should be interpreted together with year structure and missingness.
+
+---
+
+## Missingness in key variables
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+vars_key <- c(
+  "fert_Nmin_tot",
+  "fert_N_tot",
+  "fert_P_tot",
+  "fert_K_tot",
+  "soil_0_20_Ntot",
+  "soil_0_20_P_test",
+  "soil_0_20_K_test",
+  "annual_N_uptake",
+  "annual_P_uptake",
+  "annual_K_uptake",
+  "annual_total_biomass_maincrop_DM"
+)
+
+missing_summary <- ZOFE_WW %>%
+  select(all_of(vars_key)) %>%
+  summarise(across(
+    everything(),
+    ~ mean(is.na(.x)) * 100,
+    .names = "{.col}"
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "pct_missing"
+  ) %>%
+  arrange(desc(pct_missing))
+
+missing_summary %>%
+  ggplot(aes(x = fct_reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Missingness in key variables",
+    x = NULL,
+    y = "Missing values (%)"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Biomass distribution
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+ZOFE_WW %>%
+  ggplot(aes(x = annual_total_biomass_maincrop_DM)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Distribution of winter wheat biomass",
+    x = "Annual total biomass of main crop (DM)",
+    y = "Number of observations"
+  ) +
+  theme_bw()
+```
+
+**Interpretation:** this shows the total productivity range before comparing fertilizer treatments.
+
+---
+
+## Fertilization treatments ranked by biomass
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+treatment_biomass_summary <- ZOFE_WW %>%
+  group_by(treatment_en) %>%
+  summarise(
+    n = n(),
+    mean_biomass = mean(annual_total_biomass_maincrop_DM, na.rm = TRUE),
+    median_biomass = median(annual_total_biomass_maincrop_DM, na.rm = TRUE),
+    sd_biomass = sd(annual_total_biomass_maincrop_DM, na.rm = TRUE),
+    se_biomass = sd_biomass / sqrt(sum(!is.na(annual_total_biomass_maincrop_DM))),
+    lower_mean = mean_biomass - 1.96 * se_biomass,
+    upper_mean = mean_biomass + 1.96 * se_biomass,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_biomass))
+
+treatment_biomass_order <- treatment_biomass_summary$treatment_en
+
+ZOFE_WW <- ZOFE_WW %>%
+  mutate(
+    treatment_en = factor(treatment_en, levels = treatment_biomass_order)
+  )
+
+treatment_colors <- treatment_colors[treatment_biomass_order]
+
+treatment_biomass_summary %>%
+  ggplot(aes(
+    x = factor(treatment_en, levels = rev(treatment_biomass_order)),
+    y = mean_biomass,
+    fill = treatment_en
+  )) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lower_mean, ymax = upper_mean), width = 0.2) +
+  scale_fill_manual(values = treatment_colors, guide = "none") +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Treatment ranking by mean biomass",
+    subtitle = "Error bars show approximate 95% intervals around treatment means",
+    x = "Treatment",
+    y = "Mean biomass"
+  )
+```
+
+---
+
+## Are treatment differences large relative to variability?
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+ZOFE_WW %>%
+  mutate(
+    treatment_en = fct_reorder(
+      treatment_en,
+      annual_total_biomass_maincrop_DM,
+      .fun = median,
+      na.rm = TRUE
+    )
+  ) %>%
+  ggplot(aes(
+    x = treatment_en,
+    y = annual_total_biomass_maincrop_DM,
+    fill = treatment_en
+  )) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.25) +
+  scale_fill_manual(values = treatment_colors, guide = "none") +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Biomass variation within and between treatments",
+    x = "Treatment",
+    y = "Annual total biomass of main crop (DM)"
+  )
+```
+
+**Interpretation:** overlapping distributions imply that average rankings should be interpreted cautiously.
+
+---
+
+## Does biomass fluctuate year-to-year?
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+
+ZOFE_WW %>%
+  ggplot(aes(
+    x = factor(year),
+    y = annual_total_biomass_maincrop_DM,
+    color = treatment_en
+  )) +
+  geom_boxplot(
+    outlier.shape = NA,
+    color = "black"
+  ) +
+  geom_jitter(
+    width = 0.18,
+    #alpha = 0.45,
+    size = 1.3
+  ) +
+  scale_color_manual(values = treatment_colors) +
+  labs(
+    title = "Biomass distributions across years",
+    subtitle = "Individual observations are colored by fertilization treatment",
+    x = "Year",
+    y = "Annual total biomass of main crop (DM)",
+    color = "Treatment"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Year-to-year biomass anomalies
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+overall_mean_biomass <- mean(
+  ZOFE_WW$annual_total_biomass_maincrop_DM,
+  na.rm = TRUE
+)
+
+year_anomaly <- ZOFE_WW %>%
+  group_by(year) %>%
+  summarise(
+    mean_biomass = mean(annual_total_biomass_maincrop_DM, na.rm = TRUE),
+    anomaly = mean_biomass - overall_mean_biomass,
+    .groups = "drop"
+  )
+
+year_anomaly %>%
+  ggplot(aes(x = year, y = anomaly)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Year-to-year biomass anomalies",
+    subtitle = "Positive values indicate years above the overall dataset mean",
+    x = "Year",
+    y = "Biomass anomaly"
+  ) +
+  theme_bw()
+```
+
+**Interpretation:** large anomalies indicate that year effects may dominate simple treatment averages.
+
+---
+
+## Treatment trajectories across years
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+treatment_year_summary <- ZOFE_WW %>%
+  group_by(year, treatment_en) %>%
+  summarise(
+    n = n(),
+    mean_biomass = mean(annual_total_biomass_maincrop_DM, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+treatment_year_summary %>%
+  ggplot(aes(
+    x = year,
+    y = mean_biomass,
+    group = treatment_en,
+    color = treatment_en
+  )) +
+  geom_line(alpha = 0.75) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = treatment_colors) +
+  labs(
+    title = "Treatment-specific biomass trajectories",
+    x = "Year",
+    y = "Mean biomass",
+    color = "Treatment"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Treatment ranking stability across years
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+treatment_year_ranks <- treatment_year_summary %>%
+  group_by(year) %>%
+  mutate(
+    biomass_rank = rank(-mean_biomass, ties.method = "average")
+  ) %>%
+  ungroup()
+
+treatment_year_ranks %>%
+  ggplot(aes(
+    x = year,
+    y = biomass_rank,
+    group = treatment_en,
+    color = treatment_en
+  )) +
+  geom_line(alpha = 0.75) +
+  geom_point(size = 1.5) +
+  scale_y_reverse(breaks = pretty_breaks()) +
+  scale_color_manual(values = treatment_colors) +
+  labs(
+    title = "Treatment rank by biomass across years",
+    subtitle = "Rank 1 means highest mean biomass in that year",
+    x = "Year",
+    y = "Biomass rank",
+    color = "Treatment"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Fertilizer nutrient content
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+
+fert_summary <- ZOFE_WW %>%
+  group_by(treatment_en) %>%
+  summarise(
+    mean_N = mean(fert_N_tot, na.rm = TRUE),
+    mean_P = mean(fert_P_tot, na.rm = TRUE),
+    mean_K = mean(fert_K_tot, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = starts_with("mean_"),
+    names_to = "nutrient",
+    values_to = "amount"
+  ) %>%
+  mutate(
+    treatment_en = factor(treatment_en, levels = treatment_biomass_order),
+    nutrient = recode(
+      nutrient,
+      mean_N = "Nitrogen (N)",
+      mean_P = "Phosphorus (P)",
+      mean_K = "Potassium (K)"
+    )
+  )
+
+ggplot(
+  fert_summary,
+  aes(
+    x = treatment_en,
+    y = amount,
+    fill = treatment_en
+  )
+) +
+  geom_col() +
+  facet_wrap(~ nutrient, scales = "free_y") +
+  scale_fill_manual(values = treatment_colors, guide = "none") +
+  labs(
+    title = "Average fertilizer nutrient inputs by treatment",
+    subtitle = "Averaged across all years",
+    x = "Treatment",
+    y = "Average nutrient input"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+--- 
+
+## Heatmap: treatment performance by year
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+treatment_year_ranks %>%
+  ggplot(aes(
+    x = year,
+    y = fct_reorder(treatment_en, mean_biomass, .fun = mean),
+    fill = mean_biomass
+  )) +
+  geom_tile() +
+  labs(
+    title = "Mean biomass by treatment and year",
+    x = "Year",
+    y = "Treatment",
+    fill = "Mean biomass"
+  ) +
+  theme_bw()
+```
+
+**Interpretation:** horizontal patterns show consistently strong or weak treatments; vertical patterns show high- or low-productivity years.
+
+---
+
+## Fertilizer inputs and biomass
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+fert_vars <- c("fert_Nmin_tot", "fert_N_tot", "fert_P_tot", "fert_K_tot")
+
+ZOFE_WW %>%
+  select(all_of(c(fert_vars, "annual_total_biomass_maincrop_DM", "treatment_en", "year"))) %>%
+  pivot_longer(
+    cols = all_of(fert_vars),
+    names_to = "fertilizer_variable",
+    values_to = "fertilizer_amount"
+  ) %>%
+  ggplot(aes(
+    x = fertilizer_amount,
+    y = annual_total_biomass_maincrop_DM,
+    color = treatment_en,
+    shape = factor(year)
+  )) +
+  geom_point() +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "black", alpha = 0.45) +
+  facet_wrap(~ fertilizer_variable, scales = "free_x") +
+  scale_color_manual(values = treatment_colors) +
+  scale_shape_manual(values = year_shapes) +
+  labs(
+    title = "Fertilizer inputs and biomass",
+    subtitle = "Points are colored by fertilization treatment; LOESS curves are descriptive and do not imply causality",
+    x = "Fertilizer input",
+    y = "Biomass",
+    color = "Treatment",
+    shape = "Year"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Nutrient uptake and biomass
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+uptake_vars <- c("annual_N_uptake", "annual_P_uptake", "annual_K_uptake")
+
+ZOFE_WW %>%
+  select(all_of(c(uptake_vars, "annual_total_biomass_maincrop_DM", "treatment_en", "year"))) %>%
+  pivot_longer(
+    cols = all_of(uptake_vars),
+    names_to = "uptake_variable",
+    values_to = "uptake"
+  ) %>%
+  ggplot(aes(
+    x = uptake,
+    y = annual_total_biomass_maincrop_DM,
+    color = treatment_en,
+    shape = factor(year)
+  )) +
+  geom_point() +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "black", alpha = 0.45) +
+  facet_wrap(~ uptake_variable, scales = "free_x") +
+  scale_color_manual(values = treatment_colors) +
+  scale_shape_manual(values = year_shapes) +
+  labs(
+    title = "Nutrient uptake and biomass",
+    subtitle = "Descriptive context for SEM biomass-path coefficients",
+    x = "Nutrient uptake",
+    y = "Biomass",
+    color = "Treatment",
+    shape = "Year"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Nutrient uptake relationship
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+
+uptake_pair_data <- bind_rows(
+  ZOFE_WW %>%
+    transmute(
+      pair = "Nitrogen vs phosphorus",
+      x_value = annual_N_uptake,
+      y_value = annual_P_uptake,
+      x_label = "Annual N uptake",
+      y_label = "Annual P uptake",
+      treatment_en,
+      year
+    ),
+  ZOFE_WW %>%
+    transmute(
+      pair = "Nitrogen vs potassium",
+      x_value = annual_N_uptake,
+      y_value = annual_K_uptake,
+      x_label = "Annual N uptake",
+      y_label = "Annual K uptake",
+      treatment_en,
+      year
+    ),
+  ZOFE_WW %>%
+    transmute(
+      pair = "Phosphorus vs potassium",
+      x_value = annual_P_uptake,
+      y_value = annual_K_uptake,
+      x_label = "Annual P uptake",
+      y_label = "Annual K uptake",
+      treatment_en,
+      year
+    )
+)
+
+uptake_pair_labels <- uptake_pair_data %>%
+  group_by(pair) %>%
+  summarise(
+    x = min(x_value, na.rm = TRUE),
+    y = max(y_value, na.rm = TRUE),
+    label = paste0("r = ", round(cor(x_value, y_value, use = "pairwise.complete.obs"), 2)),
+    .groups = "drop"
+  )
+
+ggplot(
+  uptake_pair_data,
+  aes(
+    x = x_value,
+    y = y_value,
+    color = treatment_en,
+    shape = factor(year)
+  )
+) +
+  geom_point() +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE, color = "black", alpha = 0.45) +
+  geom_text(
+    data = uptake_pair_labels,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    vjust = 1,
+    size = 4
+  ) +
+  facet_wrap(~ pair, scales = "free") +
+  scale_color_manual(values = treatment_colors) +
+  scale_shape_manual(values = year_shapes) +
+  labs(
+    title = "Nutrient uptake relationship",
+    subtitle = "Each panel shows one pair of uptake variables with linear trend and Pearson correlation",
+    x = "First nutrient uptake variable",
+    y = "Second nutrient uptake variable",
+    color = "Treatment",
+    shape = "Year"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Soil vs fertilizer nutrient scatter plots
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+
+soil_fert_data <- bind_rows(
+  ZOFE_WW %>% transmute(nutrient = "Nitrogen (N)", fertilizer_input = fert_N_tot, soil = soil_0_20_Ntot, treatment_en, year),
+  ZOFE_WW %>% transmute(nutrient = "Phosphorus (P)", fertilizer_input = fert_P_tot, soil = soil_0_20_P_test, treatment_en, year),
+  ZOFE_WW %>% transmute(nutrient = "Potassium (K)", fertilizer_input = fert_K_tot, soil = soil_0_20_K_test, treatment_en, year)
+)
+
+ggplot(
+  soil_fert_data,
+  aes(
+    x = fertilizer_input,
+    y = soil,
+    color = treatment_en,
+    shape = factor(year)
+  )
+) +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, alpha = 0.45, color = 'grey', fill = 'grey90') +
+  geom_point() +
+  facet_wrap(~ nutrient, scales = "free") +
+  scale_color_manual(values = treatment_colors) +
+  scale_shape_manual(values = year_shapes) +
+  labs(
+    title = "Soil vs fertilizer nutrient scatter plots",
+    subtitle = "Points are colored by treatment and shaped by year",
+    x = "Fertilizer nutrient input",
+    y = "Soil nutrient measurement",
+    color = "Treatment",
+    shape = "Year"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Fertilizer vs plant uptake scatter plots
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+
+plant_fert_uptake_data <- bind_rows(
+  ZOFE_WW %>% transmute(nutrient = "Nitrogen (N)", fertilizer = fert_N_tot, uptake = annual_N_uptake, treatment_en, year),
+  ZOFE_WW %>% transmute(nutrient = "Phosphorus (P)", fertilizer = fert_P_tot, uptake = annual_P_uptake, treatment_en, year),
+  ZOFE_WW %>% transmute(nutrient = "Potassium (K)", fertilizer = fert_K_tot, uptake = annual_K_uptake, treatment_en, year)
+)
+
+ggplot(
+  plant_fert_uptake_data,
+  aes(
+    x = fertilizer,
+    y = uptake,
+    color = treatment_en,
+    shape = factor(year)
+  )
+) +  
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, alpha = 0.45, color = 'grey', fill = 'grey90') +
+  geom_point() +
+  facet_wrap(~ nutrient, scales = "free") +
+  scale_color_manual(values = treatment_colors) +
+  scale_shape_manual(values = year_shapes) +
+  labs(
+    title = "Fertilizer vs plant uptake scatter plots",
+    subtitle = "Points are colored by treatment and shaped by year",
+    x = "Fertilizer nutrient input",
+    y = "Plant nutrient uptake",
+    color = "Treatment",
+    shape = "Year"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Soil vs plant uptake scatter plots
+
+```{r}
+#| fig-width: 10
+#| fig-height: 5
+
+soil_uptake_data <- bind_rows(
+  ZOFE_WW %>% transmute(nutrient = "Nitrogen (N)", soil = soil_0_20_Ntot, uptake = annual_N_uptake, treatment_en, year),
+  ZOFE_WW %>% transmute(nutrient = "Phosphorus (P)", soil = soil_0_20_P_test, uptake = annual_P_uptake, treatment_en, year),
+  ZOFE_WW %>% transmute(nutrient = "Potassium (K)", soil = soil_0_20_K_test, uptake = annual_K_uptake, treatment_en, year)
+)
+
+ggplot(
+  soil_uptake_data,
+  aes(
+    x = soil,
+    y = uptake,
+    color = treatment_en,
+    shape = factor(year)
+  )
+) +  
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, alpha = 0.45, color = 'grey', fill = 'grey90') +
+  geom_point() +
+  facet_wrap(~ nutrient, scales = "free") +
+  scale_color_manual(values = treatment_colors) +
+  scale_shape_manual(values = year_shapes) +
+  labs(
+    title = "Soil vs plant uptake scatter plots",
+    subtitle = "Points are colored by treatment and shaped by year",
+    x = "Soil nutrient measurement",
+    y = "Plant nutrient uptake",
+    color = "Treatment",
+    shape = "Year"
+  ) +
+  theme_bw()
+```
+
+---
+
+## Correlation analysis: key numeric variables
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+
+corr_vars <- c(
+  "fert_Nmin_tot",
+  "fert_N_tot",
+  "fert_P_tot",
+  "fert_K_tot",
+  "soil_0_20_Ntot",
+  "soil_0_20_P_test",
+  "soil_0_20_K_test",
+  "annual_N_uptake",
+  "annual_P_uptake",
+  "annual_K_uptake",
+  "annual_total_biomass_maincrop_DM"
+)
+
+corr_data <- ZOFE_WW %>%
+  select(all_of(corr_vars))
+
+corr_matrix <- cor(
+  corr_data,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+corr_long <- as.data.frame(as.table(corr_matrix)) %>%
+  rename(
+    variable_1 = Var1,
+    variable_2 = Var2,
+    correlation = Freq
+  )
+
+ggplot(corr_long, aes(x = variable_1, y = variable_2, fill = correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlation heatmap of fertilizer, soil, uptake, and biomass variables",
+    subtitle = "Pearson correlations using pairwise-complete observations",
+    x = NULL,
+    y = NULL,
+    fill = "r"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+**Interpretation:** this plot shows which variables move together before fitting the DAG/SEM. Strong correlations can support expected pathways, but correlation alone does not imply causation.
+
+---
+
+## Correlation structure grouped by nutrient pathway
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+
+# Variables are manually ordered to group N, P, and K pathways together.
+ordered_corr_vars <- c(
+  "fert_Nmin_tot",
+  "fert_N_tot",
+  "soil_0_20_Ntot",
+  "annual_N_uptake",
+  "fert_P_tot",
+  "soil_0_20_P_test",
+  "annual_P_uptake",
+  "fert_K_tot",
+  "soil_0_20_K_test",
+  "annual_K_uptake",
+  "annual_total_biomass_maincrop_DM"
+)
+
+ordered_corr_data <- ZOFE_WW %>%
+  select(all_of(ordered_corr_vars))
+
+ordered_corr_matrix <- cor(
+  ordered_corr_data,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+ordered_corr_long <- as.data.frame(as.table(ordered_corr_matrix)) %>%
+  rename(
+    variable_1 = Var1,
+    variable_2 = Var2,
+    correlation = Freq
+  )
+
+ordered_corr_long$variable_1 <- factor(
+  ordered_corr_long$variable_1,
+  levels = ordered_corr_vars
+)
+
+ordered_corr_long$variable_2 <- factor(
+  ordered_corr_long$variable_2,
+  levels = rev(ordered_corr_vars)
+)
+
+ggplot(
+  ordered_corr_long,
+  aes(x = variable_1, y = variable_2, fill = correlation)
+) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Correlation structure grouped by nutrient pathway",
+    subtitle = "Variables are ordered to reveal within-pathway and cross-pathway relationships",
+    x = NULL,
+    y = NULL,
+    fill = "r"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+**Interpretation:** this ordering makes it easier to visually assess whether nutrient pathways are internally coherent. For example, if nitrogen-related variables correlate strongly with each other, the N pathway may behave more consistently than pathways with weak internal correlations. Cross-pathway correlations may also suggest shared growth processes or nutrient interactions.
+
+---
+
+## Which variables correlate most with biomass?
+
+```{r}
+biomass_correlations <- corr_long %>%
+  filter(
+    variable_1 == "annual_total_biomass_maincrop_DM",
+    variable_2 != "annual_total_biomass_maincrop_DM"
+  ) %>%
+  mutate(abs_correlation = abs(correlation)) %>%
+  arrange(desc(abs_correlation))
+
+kable(
+  biomass_correlations %>%
+    select(variable_2, correlation) %>%
+    rename(
+      Variable = variable_2,
+      `Correlation with biomass` = correlation
+    ),
+  digits = 3
+)
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+
+biomass_correlations %>%
+  ggplot(aes(
+    x = fct_reorder(variable_2, correlation),
+    y = correlation
+  )) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Variables ranked by correlation with biomass",
+    subtitle = "Positive values indicate higher biomass when the variable is higher",
+    x = NULL,
+    y = "Pearson correlation with biomass"
+  ) +
+  theme_bw()
+```
+
+**Interpretation:** this ranking provides a descriptive comparison with the SEM biomass equation. Variables with strong correlations with biomass are candidates for important productivity-related pathways, but causal interpretation still requires the DAG/SEM assumptions.
+
+---
+
+## Correlations among nutrient uptake variables
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+
+uptake_corr_data <- ZOFE_WW %>%
+  select(annual_N_uptake, annual_P_uptake, annual_K_uptake)
+
+uptake_corr_matrix <- cor(
+  uptake_corr_data,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+uptake_corr_long <- as.data.frame(as.table(uptake_corr_matrix)) %>%
+  rename(
+    variable_1 = Var1,
+    variable_2 = Var2,
+    correlation = Freq
+  )
+
+ggplot(uptake_corr_long, aes(x = variable_1, y = variable_2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(correlation, 2)), size = 5) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    title = "Correlations among nutrient uptake variables",
+    subtitle = "High correlations suggest that uptake pathways are not fully independent",
+    x = NULL,
+    y = NULL,
+    fill = "r"
+  ) +
+  theme_bw()
+```
+
+**Interpretation:** if N, P, and K uptake are strongly correlated, then separate nutrient effects in SEM may partly reflect shared crop growth processes rather than fully independent nutrient pathways.
+
+---
+
+## Main EDA takeaways
+
+- Fertilization treatments differ by produced biomass.
+- Biomass appears to fluctuate substantially across years.
+- Treatment performance should be interpreted together with year-to-year variability.
+- There are noticeable issues with the data:
+  - missingness in nitrogen
+  - correlation of annual plant uptake variables
+  - non-linear effects
+  - negative correlation of soil nitrogen with other nutrient flux covariates and biomass
+
+---
+
+## Link to other notebooks
+
+The EDA supports the causal analysis by showing:
+
+1. how much biomass varies across treatments;
+2. whether year effects are large;
+3. whether treatment rankings are stable;
+4. whether simple fertilizer, soil, and uptake relationships appear approximately linear.
+
+The causal notebook then evaluates whether these observed patterns are consistent with a structured nutrient-pathway model. The prediction notebook then evaluates whether observed patterns might explain differences in prediction by different models
