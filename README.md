@@ -11,10 +11,12 @@
 ### Methodological
 Apply and interpret the outputs of the following methods on a ZOFE dataset:
 - Causality methods
-- Regression models
+- Regression models 
     - Random Forest
     - Linear models
     - Feature selection models
+ 
+ 
 
 ### Research questions
 
@@ -41,11 +43,14 @@ Final output: **poster**. Draft output: **R Markdown slide deck**.
   - `outputs/tables/` — generated tables
 - `docs/` — design docs etc.
 
-## Proposed Project Workflow
-1. Add dataset and data description to `data` and `data/raw/` correspondingly.
-2. (TBC) Run preprocessing scripts. Create EDA output for the dataset
-3. For each method:
-   1. Execute method-specific analysis, upload / commit the analysis, including the interpretation.
-   2. Review the analysis for the method executed by partner, upload / commit proposed edits.
-4. Consolidate key findings into slide deck draft.
-5. Convert/refine into final poster.
+## Authors contributions:
+
+Klaus Jarosh: dataset owner/provider and domain context
+ - dataset preparation
+ - result interpretation
+ - causality modeling implementation and adaptation
+Jelena Čuklina: repository maintainer, modeling setup
+ - prediction modeling
+ - assistance in causal modeling setup and interpretation
+ - presentation-ready exploratory data analyses
+both: analysis plan development, interpretation and result communication
