@@ -129,7 +129,7 @@ This motivates the main question of the notebook: nitrogen uptake may depend on 
 For this notebook, we distinguish:
 
 | Role | Example variables | Interpretation |
-|------------------------|------------------------|------------------------|
+|----|----|----|
 | Exposure / upstream input | `soil_N`, `fertilizer_N` | Candidate causal driver |
 | Mechanistic modifier | `soil_phosphate`, `plant_phosphate`, `dryMay` | May change strength or shape of uptake |
 | Mediator | `plant_N`, `biomass`, `harvest_index` | Downstream variables in pathway |

@@ -49,6 +49,26 @@ library(jsonlite)
 library(httr2)
 library(tibble)
 library(readr)
+
+resolve_repo_path <- function(...) {
+  candidates <- c(".", "..")
+
+  for (base in candidates) {
+    candidate <- file.path(base, ...)
+    if (file.exists(candidate) || dir.exists(candidate)) {
+      return(candidate)
+    }
+  }
+
+  file.path(candidates[[1]], ...)
+}
+
+dictionary_path <- resolve_repo_path("data", "weather_covariate_dictionary_updated.xlsx")
+nutrient_flux_path <- resolve_repo_path(
+  "data", "raw", "Copy of ZOFE_Mulitivariat_course_WW_2022_nutrient_fluxes.xlsx"
+)
+processed_dir <- resolve_repo_path("data", "processed")
+dir.create(processed_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
 ```{r}
@@ -347,25 +367,25 @@ extract_zurich_weather_covariates_period <- function(target_year,
 zurich_october_2021 <- extract_zurich_weather_covariates_one_month(
   calendar_year = 2021,
   month_num = 10,
-  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+  dictionary_path = dictionary_path
 )
 
 zurich_february_2020 <- extract_zurich_weather_covariates_one_month(
   calendar_year = 2020,
   month_num = 2,
-  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+  dictionary_path = dictionary_path
 )
 
 zurich_february_2022 <- extract_zurich_weather_covariates_one_month(
   calendar_year = 2022,
   month_num = 2,
-  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+  dictionary_path = dictionary_path
 )
 
 zurich_april_2022 <- extract_zurich_weather_covariates_one_month(
   calendar_year = 2022,
   month_num = 4,
-  dictionary_path = "weather_covariate_dictionary_updated.xlsx"
+  dictionary_path = dictionary_path
 )
 
 zurich_october_2021
@@ -373,10 +393,22 @@ zurich_february_2020
 zurich_february_2022
 zurich_april_2022
 
-readr::write_csv(zurich_october_2021, "zurich_weather_covariates_october_2021.csv")
-readr::write_csv(zurich_february_2020, "zurich_weather_covariates_february_2020.csv")
-readr::write_csv(zurich_february_2022, "zurich_weather_covariates_february_2022.csv")
-readr::write_csv(zurich_april_2022, "zurich_weather_covariates_april_2022.csv")
+readr::write_csv(
+  zurich_october_2021,
+  file.path(processed_dir, "zurich_weather_covariates_october_2021.csv")
+)
+readr::write_csv(
+  zurich_february_2020,
+  file.path(processed_dir, "zurich_weather_covariates_february_2020.csv")
+)
+readr::write_csv(
+  zurich_february_2022,
+  file.path(processed_dir, "zurich_weather_covariates_february_2022.csv")
+)
+readr::write_csv(
+  zurich_april_2022,
+  file.path(processed_dir, "zurich_weather_covariates_april_2022.csv")
+)
 ```
 
 ```{r}
@@ -388,7 +420,7 @@ readr::write_csv(zurich_april_2022, "zurich_weather_covariates_april_2022.csv")
 
 zurich_2022_season <- extract_zurich_weather_covariates_period(
   target_year = 2022,
-  dictionary_path = "weather_covariate_dictionary_updated.xlsx",
+  dictionary_path = dictionary_path,
   months_previous_year = 10:12,
   months_target_year = 1:6
 )
@@ -399,12 +431,12 @@ zurich_2022_season$covariates_wide
 # Save both long and wide forms.
 readr::write_csv(
   zurich_2022_season$covariates_long,
-  "zurich_weather_covariates_2022_season_long.csv"
+  file.path(processed_dir, "zurich_weather_covariates_2022_season_long.csv")
 )
 
 readr::write_csv(
   zurich_2022_season$covariates_wide,
-  "zurich_weather_covariates_2022_season_wide.csv"
+  file.path(processed_dir, "zurich_weather_covariates_2022_season_wide.csv")
 )
 
 # GDD diagnostic: should no longer be NA unless source data for April is missing.
@@ -421,7 +453,7 @@ years_weather <- list()
 for (year in years) {
   this_year <- extract_zurich_weather_covariates_period(
     target_year = year,
-    dictionary_path = "weather_covariate_dictionary_updated.xlsx",
+    dictionary_path = dictionary_path,
     months_previous_year = 10:12,
     months_target_year = 1:6
   )
@@ -432,6 +464,36 @@ df_years <- do.call(rbind, years_weather)
 ```{r}
 readr::write_csv(
   df_years,
-  "zurich_weather_covariates_1995_2022_seasons.csv"
+  file.path(processed_dir, "zurich_weather_covariates_1995_2022_seasons.csv")
+)
+```
+
+```{r}
+#| label: merge-weather-with-nutrient-flux
+
+library(readxl)
+nutrient_flux_data <- read_excel("data/raw/ZOFE_Mulitivariat_course_WW_2022_nutrient_fluxes.xlsx")
+nutrient_flux_data <- read_excel(nutrient_flux_path, 
+    skip = 1)
+
+nutrient_flux_data <- readxl::read_excel(
+  nutrient_flux_path,
+  col_names = FALSE
+) |>
+  setNames(as.character(unlist(.[1, ]))) |>
+  slice(-c(1, 2)) |>
+  mutate(year = as.integer(year))
+
+weather_with_nutrient_flux <- df_years |>
+  left_join(
+    nutrient_flux_data,
+    by = join_by(season_target_year == year)
+  )
+
+weather_with_nutrient_flux
+
+readr::write_csv(
+  weather_with_nutrient_flux,
+  file.path(processed_dir, "zurich_weather_covariates_1995_2022_seasons_merged.csv")
 )
 ```
