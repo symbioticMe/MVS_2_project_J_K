@@ -1,0 +1,909 @@
+---
+title: "Biomass Prediction for Winter Wheat"
+subtitle: "Random forest and Linear Modeling, with PDP plots for RF"
+author: "Jelena Čuklina"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+  docx:
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Objective
+
+This report combines Random Forest exploration and predictive evaluation for annual winter wheat biomass.
+
+The analysis compares three Random Forest model structures:
+
+- **Model A: Full model** — fertilizer inputs, soil variables, plant uptake variables, and year.
+- **Model B: Fertilizer model** — fertilizer inputs and year, with **no soil components**.
+- **Model C: Plant uptake model** — plant nutrient uptake variables and year.
+
+The main outputs are:
+
+1. permutation variable importance;
+2. univariate partial dependence plots;
+3. bivariate partial dependence contour plots with observed fertilizer/treatment combinations overlaid;
+4. predictive performance using R² and RMSE;
+5. comparison to a linear fertilizer benchmark;
+6. two cross-validation designs: known-year interpolation and unseen-year transferability.
+
+Year is treated as a **factor** in all primary Random Forest models. This reflects the interpretation of year as a categorical environmental/weather regime rather than a continuous temporal trend.
+
+# Setup
+
+```{r}
+#| label: setup-packages
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(rsample)
+library(ranger)
+library(pdp)
+library(patchwork)
+library(knitr)
+library(scales)
+```
+
+```{r}
+#| label: setup-global-plot-theme
+theme_set(theme_bw())
+```
+
+# Data loading
+
+```{r}
+#| label: load-biomass-data
+resolve_repo_path <- function(...) {
+  candidates <- c(".", "..")
+
+  for (base in candidates) {
+    candidate <- file.path(base, ...)
+    if (file.exists(candidate) || dir.exists(candidate)) {
+      return(candidate)
+    }
+  }
+
+  file.path(".", ...)
+}
+
+ww_data_path <- resolve_repo_path("data", "processed", "zofe_ww.csv")
+prep_script_path <- resolve_repo_path("src", "ZOFE_MVStat2_data_preparation.R")
+
+if (!file.exists(ww_data_path)) {
+  source(prep_script_path)
+}
+
+ZOFE_WW <- read_csv(ww_data_path, show_col_types = FALSE)
+```
+
+```{r}
+#| label: prepare-analysis-data
+model_data <- ZOFE_WW %>%
+  mutate(year = factor(year))
+
+outcome_var <- "annual_total_biomass_maincrop_DM"
+```
+
+# Model datasets
+
+The three datasets correspond to the three scientific questions:
+
+- the full multivariable pathway model;
+- the fertilizer-only model without soil variables;
+- the plant uptake model.
+
+```{r}
+#| label: create-model-datasets
+data_A <- model_data %>%
+  select(
+    annual_total_biomass_maincrop_DM,
+    year,
+    fert_Nmin_tot,
+    fert_N_tot,
+    fert_P_tot,
+    fert_K_tot,
+    soil_0_20_Ntot,
+    soil_0_20_P_test,
+    soil_0_20_K_test,
+    annual_N_uptake,
+    annual_P_uptake,
+    annual_K_uptake
+  ) %>%
+  drop_na()
+
+data_B <- model_data %>%
+  select(
+    annual_total_biomass_maincrop_DM,
+    year,
+    fert_Nmin_tot,
+    fert_N_tot,
+    fert_P_tot,
+    fert_K_tot
+  ) %>%
+  drop_na()
+
+data_C <- model_data %>%
+  select(
+    annual_total_biomass_maincrop_DM,
+    year,
+    annual_N_uptake,
+    annual_P_uptake,
+    annual_K_uptake
+  ) %>%
+  drop_na()
+```
+
+```{r}
+#| label: create-no-year-model-datasets
+data_A_no_year <- data_A %>% select(-year)
+data_B_no_year <- data_B %>% select(-year)
+data_C_no_year <- data_C %>% select(-year)
+```
+
+# Fit primary Random Forest models
+
+The primary models include `year` as a factor. These models are used for interpretation: variable importance, univariate PDPs, and bivariate response surfaces.
+
+```{r}
+#| label: fit-primary-random-forest-models
+set.seed(123)
+
+rf_A <- ranger(
+  annual_total_biomass_maincrop_DM ~ .,
+  data = data_A,
+  num.trees = 1000,
+  importance = "permutation",
+  respect.unordered.factors = TRUE
+)
+
+rf_B <- ranger(
+  annual_total_biomass_maincrop_DM ~ .,
+  data = data_B,
+  num.trees = 1000,
+  importance = "permutation",
+  respect.unordered.factors = TRUE
+)
+
+rf_C <- ranger(
+  annual_total_biomass_maincrop_DM ~ .,
+  data = data_C,
+  num.trees = 1000,
+  importance = "permutation",
+  respect.unordered.factors = TRUE
+)
+```
+
+# Variable importance
+
+Permutation importance is used because it is generally preferable to impurity-based importance when predictors differ in scale or are correlated.
+
+```{r}
+#| label: create-variable-importance-table
+importance_to_df <- function(model, model_name) {
+  tibble(
+    variable = names(model$variable.importance),
+    importance = as.numeric(model$variable.importance),
+    model = model_name
+  )
+}
+
+importance_all <- bind_rows(
+  importance_to_df(rf_A, "A: Full model"),
+  importance_to_df(rf_B, "B: Fertilizer model"),
+  importance_to_df(rf_C, "C: Uptake model")
+)
+
+kable(
+  importance_all %>% arrange(model, desc(importance)),
+  digits = 3,
+  caption = "Permutation variable importance by model."
+)
+```
+
+```{r}
+#| label: fig-variable-importance
+#| fig-width: 13
+#| fig-height: 5
+ggplot(
+  importance_all,
+  aes(
+    x = fct_reorder(variable, importance),
+    y = importance
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ model, scales = "free_y", nrow = 1) +
+  theme_bw() +
+  labs(
+    title = "Permutation variable importance across Random Forest models",
+    subtitle = "Higher values indicate greater contribution to biomass prediction",
+    x = NULL,
+    y = "Permutation importance"
+  )
+```
+
+## Interpretation placeholder
+
+Add interpretation of which variables dominate each model. Compare whether fertilizer, soil, uptake, or year effects are most important and whether the ranking supports the hypothesised nutrient pathways.
+
+# Partial dependence helper functions
+
+The PDP syntax follows the attached Random Forest exploration notebook. The functions call `pdp::partial()` explicitly to avoid conflicts with functions of the same name from other packages.
+
+```{r}
+#| label: define-pdp-helper-functions
+make_1d_pdp <- function(model, data, variable, title, xlab) {
+  pd <- pdp::partial(
+    object = model,
+    pred.var = variable,
+    train = data
+  )
+
+  autoplot(pd) +
+    theme_bw() +
+    labs(
+      title = title,
+      x = xlab,
+      y = "Predicted biomass"
+    )
+}
+
+make_2d_pdp <- function(model, data, variables, grid_resolution = 25) {
+  pdp::partial(
+    object = model,
+    pred.var = variables,
+    train = data,
+    grid.resolution = grid_resolution
+  )
+}
+
+plot_2d_pdp <- function(pdp_object, title, xlab, ylab) {
+  plotPartial(
+    pdp_object,
+    levelplot = TRUE,
+    contour = TRUE,
+    col.regions = rainbow(100),
+    xlab = xlab,
+    ylab = ylab,
+    main = title
+  )
+}
+
+plot_3d_pdp <- function(pdp_object, title, xlab, ylab) {
+  plotPartial(
+    pdp_object,
+    levelplot = FALSE,
+    zlab = "Predicted biomass",
+    xlab = xlab,
+    ylab = ylab,
+    main = title,
+    drape = TRUE,
+    col.regions = rainbow(100),
+    screen = list(z = -45, x = -60)
+  )
+}
+
+gg_contour_pdp <- function(pdp_object, x_var, y_var, title, xlab, ylab) {
+  ggplot(
+    pdp_object,
+    aes(
+      x = .data[[x_var]],
+      y = .data[[y_var]],
+      fill = yhat
+    )
+  ) +
+    geom_tile() +
+    geom_contour(aes(z = yhat), color = "black", alpha = 0.45) +
+    scale_fill_gradientn(colors = rainbow(100)) +
+    theme_bw() +
+    labs(
+      title = title,
+      x = xlab,
+      y = ylab,
+      fill = "Predicted biomass"
+    )
+}
+```
+
+# Treatment points for PDP contour overlays
+
+The observed treatment-level fertilizer and uptake combinations are overlaid on contour plots to show where the model has direct support from observed data.
+
+```{r}
+#| label: prepare-treatment-points
+if ("treatment_en" %in% names(ZOFE_WW)) {
+  treatment_points <- ZOFE_WW %>%
+    group_by(treatment_en) %>%
+    summarise(
+      annual_N_uptake = mean(annual_N_uptake, na.rm = TRUE),
+      annual_P_uptake = mean(annual_P_uptake, na.rm = TRUE),
+      annual_K_uptake = mean(annual_K_uptake, na.rm = TRUE),
+      fert_N_tot = mean(fert_N_tot, na.rm = TRUE),
+      fert_P_tot = mean(fert_P_tot, na.rm = TRUE),
+      fert_K_tot = mean(fert_K_tot, na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  treatment_points <- ZOFE_WW %>%
+    summarise(
+      treatment_en = "Observed mean",
+      annual_N_uptake = mean(annual_N_uptake, na.rm = TRUE),
+      annual_P_uptake = mean(annual_P_uptake, na.rm = TRUE),
+      annual_K_uptake = mean(annual_K_uptake, na.rm = TRUE),
+      fert_N_tot = mean(fert_N_tot, na.rm = TRUE),
+      fert_P_tot = mean(fert_P_tot, na.rm = TRUE),
+      fert_K_tot = mean(fert_K_tot, na.rm = TRUE)
+    )
+}
+
+add_treatment_points <- function(plot_object, x_var, y_var, point_data = treatment_points) {
+  plot_object +
+    geom_point(
+      data = point_data,
+      aes(x = .data[[x_var]], y = .data[[y_var]]),
+      inherit.aes = FALSE,
+      size = 2.8,
+      shape = 21,
+      fill = "white",
+      color = "black"
+    ) +
+    geom_text(
+      data = point_data,
+      aes(x = .data[[x_var]], y = .data[[y_var]], label = treatment_en),
+      inherit.aes = FALSE,
+      size = 2.8,
+      nudge_y = 0.04,
+      check_overlap = TRUE
+    )
+}
+```
+
+# Univariate partial dependence plots
+
+PDPs show the marginal relationship between one predictor and predicted biomass while averaging over the observed distribution of the other predictors.
+
+## Model A: full model PDPs
+
+```{r}
+#| label: fig-pdp-full-model
+#| fig-width: 13
+#| fig-height: 7
+pdp_A_fert_P <- make_1d_pdp(
+  rf_A,
+  data_A,
+  "fert_P_tot",
+  "Model A: phosphorus fertilizer",
+  "P fertilizer input"
+)
+
+pdp_A_N_uptake <- make_1d_pdp(
+  rf_A,
+  data_A,
+  "annual_N_uptake",
+  "Model A: nitrogen uptake",
+  "N uptake"
+)
+
+pdp_A_P_uptake <- make_1d_pdp(
+  rf_A,
+  data_A,
+  "annual_P_uptake",
+  "Model A: phosphorus uptake",
+  "P uptake"
+)
+
+pdp_A_K_uptake <- make_1d_pdp(
+  rf_A,
+  data_A,
+  "annual_K_uptake",
+  "Model A: potassium uptake",
+  "K uptake"
+)
+
+(pdp_A_fert_P + pdp_A_N_uptake) / (pdp_A_P_uptake + pdp_A_K_uptake)
+```
+
+## Interpretation placeholder
+
+Add interpretation of whether the full model suggests monotonic, threshold-like, or saturating responses. Note which PDPs align with variable importance results.
+
+## Model B: fertilizer model PDPs
+
+```{r}
+#| label: fig-pdp-fertilizer-model
+#| fig-width: 13
+#| fig-height: 4
+pdp_B_Nmin <- make_1d_pdp(
+  rf_B,
+  data_B,
+  "fert_Nmin_tot",
+  "Model B: mineral nitrogen fertilizer",
+  "Mineral N fertilizer input"
+)
+
+pdp_B_N <- make_1d_pdp(
+  rf_B,
+  data_B,
+  "fert_N_tot",
+  "Model B: total nitrogen fertilizer",
+  "Total N fertilizer input"
+)
+
+pdp_B_P <- make_1d_pdp(
+  rf_B,
+  data_B,
+  "fert_P_tot",
+  "Model B: phosphorus fertilizer",
+  "P fertilizer input"
+)
+
+pdp_B_K <- make_1d_pdp(
+  rf_B,
+  data_B,
+  "fert_K_tot",
+  "Model B: potassium fertilizer",
+  "K fertilizer input"
+)
+
+(pdp_B_Nmin + pdp_B_N + pdp_B_P + pdp_B_K)
+```
+
+## Interpretation placeholder
+
+Add interpretation of which fertilizer dimensions show the clearest marginal response and whether the response appears linear enough to support the fertilizer linear model benchmark.
+
+## Model C: uptake model PDPs
+
+```{r}
+#| label: fig-pdp-uptake-model
+#| fig-width: 12
+#| fig-height: 4
+pdp_C_N <- make_1d_pdp(
+  rf_C,
+  data_C,
+  "annual_N_uptake",
+  "Model C: nitrogen uptake",
+  "N uptake"
+)
+
+pdp_C_P <- make_1d_pdp(
+  rf_C,
+  data_C,
+  "annual_P_uptake",
+  "Model C: phosphorus uptake",
+  "P uptake"
+)
+
+pdp_C_K <- make_1d_pdp(
+  rf_C,
+  data_C,
+  "annual_K_uptake",
+  "Model C: potassium uptake",
+  "K uptake"
+)
+
+pdp_C_N + pdp_C_P + pdp_C_K
+```
+
+## Interpretation placeholder
+
+Add interpretation of whether uptake variables show stronger and smoother relationships with biomass than fertilizer inputs.
+
+# Bivariate PDP contour plots
+
+Bivariate PDPs are used to explore possible nutrient interactions. Treatment-level observed combinations are overlaid to identify the part of the surface supported by observed treatments.
+
+## Fertilizer interaction contours
+
+```{r}
+#| label: fig-fertilizer-interaction-contours
+#| fig-width: 15
+#| fig-height: 4
+pdp_fert_NP <- make_2d_pdp(
+  rf_B,
+  data_B,
+  c("fert_N_tot", "fert_P_tot")
+)
+
+pdp_fert_NK <- make_2d_pdp(
+  rf_B,
+  data_B,
+  c("fert_N_tot", "fert_K_tot")
+)
+
+pdp_fert_PK <- make_2d_pdp(
+  rf_B,
+  data_B,
+  c("fert_P_tot", "fert_K_tot")
+)
+
+fert_contour_NP <- gg_contour_pdp(
+  pdp_fert_NP,
+  "fert_N_tot",
+  "fert_P_tot",
+  "N fertilizer × P fertilizer",
+  "N fertilizer input",
+  "P fertilizer input"
+) %>%
+  add_treatment_points("fert_N_tot", "fert_P_tot")
+
+fert_contour_NK <- gg_contour_pdp(
+  pdp_fert_NK,
+  "fert_N_tot",
+  "fert_K_tot",
+  "N fertilizer × K fertilizer",
+  "N fertilizer input",
+  "K fertilizer input"
+) %>%
+  add_treatment_points("fert_N_tot", "fert_K_tot")
+
+fert_contour_PK <- gg_contour_pdp(
+  pdp_fert_PK,
+  "fert_P_tot",
+  "fert_K_tot",
+  "P fertilizer × K fertilizer",
+  "P fertilizer input",
+  "K fertilizer input"
+) %>%
+  add_treatment_points("fert_P_tot", "fert_K_tot")
+
+fert_contour_NP + fert_contour_NK + fert_contour_PK
+```
+
+## Interpretation placeholder
+
+Add interpretation of whether high predicted biomass occurs only under specific fertilizer combinations, which would suggest co-limitation or interaction.
+
+## Plant uptake interaction contours
+
+```{r}
+#| label: fig-uptake-interaction-contours
+#| fig-width: 15
+#| fig-height: 4
+pdp_uptake_NP <- make_2d_pdp(
+  rf_A,
+  data_A,
+  c("annual_N_uptake", "annual_P_uptake")
+)
+
+pdp_uptake_NK <- make_2d_pdp(
+  rf_A,
+  data_A,
+  c("annual_N_uptake", "annual_K_uptake")
+)
+
+pdp_uptake_PK <- make_2d_pdp(
+  rf_A,
+  data_A,
+  c("annual_P_uptake", "annual_K_uptake")
+)
+
+uptake_contour_NP <- gg_contour_pdp(
+  pdp_uptake_NP,
+  "annual_N_uptake",
+  "annual_P_uptake",
+  "N uptake × P uptake",
+  "N uptake",
+  "P uptake"
+) %>%
+  add_treatment_points("annual_N_uptake", "annual_P_uptake")
+
+uptake_contour_NK <- gg_contour_pdp(
+  pdp_uptake_NK,
+  "annual_N_uptake",
+  "annual_K_uptake",
+  "N uptake × K uptake",
+  "N uptake",
+  "K uptake"
+) %>%
+  add_treatment_points("annual_N_uptake", "annual_K_uptake")
+
+uptake_contour_PK <- gg_contour_pdp(
+  pdp_uptake_PK,
+  "annual_P_uptake",
+  "annual_K_uptake",
+  "P uptake × K uptake",
+  "P uptake",
+  "K uptake"
+) %>%
+  add_treatment_points("annual_P_uptake", "annual_K_uptake")
+
+uptake_contour_NP + uptake_contour_NK + uptake_contour_PK
+```
+
+## Interpretation 
+
+Plant uptake interaction surfaces are smoother or more predictive than fertilizer interaction surfaces.
+
+# Cross-validation design
+
+Two cross-validation designs are reported because `year` has different meanings in different prediction tasks.
+
+## Design 1: known-year interpolation
+
+In this design, year is included as a factor. Folds are stratified by year, so each fold represents prediction within the observed year regimes. This avoids the new-factor-level problem and evaluates performance when the model is used within known years.
+
+## Design 2: unseen-year transferability
+
+In this design, year is removed from the model and folds leave one year out. This evaluates whether fertilizer, soil, and uptake variables transfer to genuinely unseen years. A model with year as a factor cannot predict a year absent from training.
+
+# Performance helper functions
+
+```{r}
+#| label: define-performance-helper-functions
+calc_metrics <- function(obs, pred) {
+  tibble(
+    R2 = cor(obs, pred, use = "complete.obs")^2,
+    RMSE = sqrt(mean((obs - pred)^2, na.rm = TRUE))
+  )
+}
+
+fit_predict_ranger <- function(train, test) {
+  fit <- ranger(
+    annual_total_biomass_maincrop_DM ~ .,
+    data = train,
+    num.trees = 1000,
+    respect.unordered.factors = TRUE
+  )
+
+  predict(fit, data = test)$predictions
+}
+
+fit_predict_lm_fertilizer <- function(train, test) {
+  fit <- lm(
+    annual_total_biomass_maincrop_DM ~ .,
+    data = train
+  )
+
+  as.numeric(predict(fit, newdata = test))
+}
+
+evaluate_split <- function(split, data, model_name, model_type = c("rf", "lm"), cv_design) {
+  model_type <- match.arg(model_type)
+
+  train_ids <- rsample::analysis(split)$.row_id
+  test_ids <- rsample::assessment(split)$.row_id
+
+  train <- data %>% filter(.row_id %in% train_ids) %>% select(-.row_id)
+  test <- data %>% filter(.row_id %in% test_ids) %>% select(-.row_id)
+
+  if ("year" %in% names(train)) {
+    train$year <- factor(train$year)
+    test$year <- factor(test$year, levels = levels(train$year))
+
+    if (any(is.na(test$year))) {
+      stop(
+        "The test set contains year levels not present in the training set. ",
+        "Use stratified known-year CV for models with year, or remove year for leave-one-year-out CV."
+      )
+    }
+  }
+
+  pred <- if (model_type == "rf") {
+    fit_predict_ranger(train, test)
+  } else {
+    fit_predict_lm_fertilizer(train, test)
+  }
+
+  calc_metrics(test$annual_total_biomass_maincrop_DM, pred) %>%
+    mutate(
+      model = model_name,
+      cv_design = cv_design
+    )
+}
+
+evaluate_cv <- function(split_object, data, model_name, model_type = "rf", cv_design) {
+  bind_rows(
+    lapply(
+      split_object$splits,
+      evaluate_split,
+      data = data,
+      model_name = model_name,
+      model_type = model_type,
+      cv_design = cv_design
+    )
+  )
+}
+
+summarise_performance <- function(results) {
+  results %>%
+    pivot_longer(
+      cols = c(R2, RMSE),
+      names_to = "metric",
+      values_to = "value"
+    ) %>%
+    group_by(cv_design, model, metric) %>%
+    summarise(
+      mean = mean(value, na.rm = TRUE),
+      sd = sd(value, na.rm = TRUE),
+      n_folds = sum(!is.na(value)),
+      .groups = "drop"
+    )
+}
+```
+
+# Known-year interpolation performance
+
+```{r}
+#| label: create-known-year-cv-folds
+set.seed(123)
+
+known_year_A <- data_A %>% mutate(.row_id = row_number())
+known_year_B <- data_B %>% mutate(.row_id = row_number())
+known_year_C <- data_C %>% mutate(.row_id = row_number())
+
+known_year_folds_A <- vfold_cv(known_year_A, v = 10, strata = year)
+known_year_folds_B <- vfold_cv(known_year_B, v = 10, strata = year)
+known_year_folds_C <- vfold_cv(known_year_C, v = 10, strata = year)
+```
+
+```{r}
+#| label: evaluate-known-year-performance
+set.seed(123)
+
+known_year_results <- bind_rows(
+  evaluate_cv(known_year_folds_A, known_year_A, "RF A: Full", "rf", "Known-year stratified CV"),
+  evaluate_cv(known_year_folds_B, known_year_B, "RF B: Fertilizer", "rf", "Known-year stratified CV"),
+  evaluate_cv(known_year_folds_C, known_year_C, "RF C: Uptake", "rf", "Known-year stratified CV"),
+  evaluate_cv(known_year_folds_B, known_year_B, "LM B: Fertilizer", "lm", "Known-year stratified CV"),
+  evaluate_cv(known_year_folds_C, known_year_C, "LM C: Uptake", "lm", "Known-year stratified CV")
+)
+
+known_year_summary <- summarise_performance(known_year_results)
+
+kable(
+  known_year_summary,
+  digits = 3,
+  caption = "Known-year stratified cross-validation performance."
+)
+```
+
+```{r}
+#| label: fig-performance-known-year-cv-1
+ggplot(known_year_summary , aes(x = fct_rev(model), y = mean))+geom_col(fill = "white", color = "darkgrey")+
+    geom_errorbar(
+        aes(ymin = mean - sd, ymax = mean + sd),
+        width = 0.2, color = 'darkgrey'
+    ) +theme_bw()+facet_grid(cv_design ~ metric, scale = 'free')+ylab(NULL)+xlab(NULL)+coord_flip() +
+  labs(
+    title = "Model performance under known-year stratified CV",
+    subtitle = "Bars show mean across folds; error bars show ±1 SD")
+```
+
+```{r}
+#| label: fig-performance-known-year-cv-2
+
+plot_df <- known_year_summary %>% filter(!(model %in% c("LM B: Fertilizer", "LM C: Uptake")))
+ggplot(plot_df, aes(x = fct_rev(model), y = mean))+geom_col(fill = "white", color = "darkgrey")+
+    geom_errorbar(
+        aes(ymin = mean - sd, ymax = mean + sd),
+        width = 0.2, color = 'darkgrey'
+    ) +theme_bw()+facet_grid(cv_design ~ metric, scale = 'free')+ylab(NULL)+xlab(NULL)+coord_flip() +
+  labs(
+    title = "Model performance under known-year stratified CV",
+    subtitle = "Bars show mean across folds; error bars show ±1 SD")
+```
+
+## Interpretation placeholder
+
+Add interpretation of which model performs best when prediction occurs within known year regimes. Compare Random Forest models with the fertilizer linear benchmark.
+
+# Unseen-year transferability performance
+
+```{r}
+#| label: create-unseen-year-cv-folds
+set.seed(123)
+
+unseen_year_A <- data_A_no_year %>%
+  mutate(.row_id = row_number(), year_group = data_A$year)
+
+unseen_year_B <- data_B_no_year %>%
+  mutate(.row_id = row_number(), year_group = data_B$year)
+
+unseen_year_C <- data_C_no_year %>%
+  mutate(.row_id = row_number(), year_group = data_C$year)
+
+unseen_year_folds_A <- group_vfold_cv(unseen_year_A, group = year_group)
+unseen_year_folds_B <- group_vfold_cv(unseen_year_B, group = year_group)
+unseen_year_folds_C <- group_vfold_cv(unseen_year_C, group = year_group)
+
+unseen_year_A_model <- unseen_year_A %>% select(-year_group)
+unseen_year_B_model <- unseen_year_B %>% select(-year_group)
+unseen_year_C_model <- unseen_year_C %>% select(-year_group)
+```
+
+```{r}
+#| label: evaluate-unseen-year-performance
+set.seed(123)
+
+unseen_year_results <- bind_rows(
+  evaluate_cv(unseen_year_folds_A, unseen_year_A_model, "RF A: Full, no year", "rf", "Leave-one-year-out CV"),
+  evaluate_cv(unseen_year_folds_B, unseen_year_B_model, "RF B: Fertilizer, no year", "rf", "Leave-one-year-out CV"),
+  evaluate_cv(unseen_year_folds_C, unseen_year_C_model, "RF C: Uptake, no year", "rf", "Leave-one-year-out CV"),
+  evaluate_cv(unseen_year_folds_B, unseen_year_B_model, "LM B: Fertilizer, no year", "lm", "Leave-one-year-out CV"),
+  evaluate_cv(unseen_year_folds_C, unseen_year_C_model, "LM C: Uptake, no year", "lm", "Leave-one-year-out CV")
+)
+
+unseen_year_summary <- summarise_performance(unseen_year_results)
+
+kable(
+  unseen_year_summary,
+  digits = 3,
+  caption = "Leave-one-year-out cross-validation performance for no-year models."
+)
+```
+
+```{r}
+#| label: fig-performance-unseen-year-cv-1
+ggplot(unseen_year_summary, aes(x = fct_rev(model), y = mean))+geom_col(fill = "white", color = "darkgrey")+
+    geom_errorbar(
+        aes(ymin = mean - sd, ymax = mean + sd),
+        width = 0.2, color = 'darkgrey'
+    ) +theme_bw()+facet_grid(cv_design ~ metric, scale = 'free')+ylab(NULL)+xlab("Model")+coord_flip()
+```
+
+
+## Interpretation 
+
+Lower performance here compared with known-year CV indicates that year-specific environmental regimes explain substantial biomass variation.
+
+# Combined performance table
+
+```{r}
+#| label: table-combined-performance-summary
+performance_summary <- bind_rows(known_year_summary, unseen_year_summary) %>%
+  mutate(model = factor(model, levels = c("LM B: Fertilizer", "LM C: Uptake", "RF A: Full", "RF B: Fertilizer", "RF C: Uptake", 
+"LM B: Fertilizer, no year", "LM C: Uptake, no year", "RF A: Full, no year", "RF B: Fertilizer, no year", 
+"RF C: Uptake, no year")))
+
+kable(
+  performance_summary,
+  digits = 3,
+  caption = "Performance summary across cross-validation designs."
+)
+```
+
+```{r}
+#| label: plt-combined-performance-summary
+ggplot(performance_summary, aes(x = fct_rev(model), y = mean))+geom_col(fill = "white", color = "darkgrey")+
+    geom_errorbar(
+        aes(ymin = mean - sd, ymax = mean + sd),
+        width = 0.2, color = 'darkgrey'
+    ) +theme_bw()+facet_grid(cv_design ~ metric, scale = 'free')+ylab(NULL)+xlab("Model")+coord_flip()
+```
+
+
+## Interpretation 
+
+The two cross-validation designs answer different questions:
+
+- **Known-year stratified CV** evaluates interpolation within observed year regimes. It is appropriate when `year` is part of the explanatory model and all prediction years are represented during training.
+- **Leave-one-year-out CV** evaluates transferability to a new environmental regime. In this setting, `year` must be excluded because a factor model cannot predict a truly unseen year level.
+
+# Final interpretation 
+
+
+- Which predictors are most important?
+  - When annual plan uptake is available, these features are most predictive and nitrogen is most predictive of them all (in contrast to phosphate in SEM)
+  - Among fertilizer convariates, also nitrogen (total nitrogen) is most predictive
+- Are fertilizer/plant uptake response surfaces mostly additive or interactive?
+  - surfaces seem to be mostly additive, however, it is possible that dual threshold behavior is possible, more data and additional analyses are probably needed to answer this
+- Does plant uptake explain biomass better than fertilizer inputs alone?
+  - Plant uptake has the most information on biomass, which is logical, considering DAG. However, fertilizer nutrient content alone is reasonably predictive
+- How large is the performance gap between known-year interpolation and unseen-year transferability?
+  - Fertilizer : 0.879 vs 0.629 with known year vs "no year" model (or double the RMSE)
+  - Plant uptake: 0.968 vs 0.902   (or double the RMSE)
+  - Jointly, this points that year bears critical information. To adjust for that in "next year prediction", it would make sense to include weather covariatates directly (rainfall in winter, temperatures at planting etc.)
+- Is the linear fertilizer benchmark competitive, or does Random Forest provide clear predictive benefit?
+  - Linear models are of high predictive performance, although Randomr Forest delivers consistent benefit, pointing to some non-linear relationships and interactions
