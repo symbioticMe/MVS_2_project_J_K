@@ -1,0 +1,620 @@
+---
+title: "DAG and SEM analysis of wheat biomass production"
+subtitle: "Fertilization inputs, soil nutrient status, and plant nutrient uptake pathways"
+author: "created by Klaus Jarosh, modified by Jelena Čuklina"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+  docx:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Purpose of this notebook
+
+This notebook investigates determinants of winter wheat biomass production in relation to fertilization inputs, soil nutrient status, and plant nutrient uptake.
+
+The central research question is:
+
+> To what extent can variation in winter wheat biomass production be explained by fertilization inputs, soil nutrient status, and plant nutrient uptake pathways?
+
+The analysis focuses on three nutrient systems: nitrogen (N), phosphorus (P), and potassium (K). The goal is not to identify a single universally "best" fertilizer. Instead, the goal is to evaluate which fertilization-related nutrient pathways appear most strongly associated with biomass production, and how well a biologically motivated pathway model explains the observed data.
+
+To formalize the assumed biological structure, the notebook first defines a directed acyclic graph (DAG). The DAG is not treated as proof of causality. Rather, it is used as a transparent statement of assumptions about temporal and biological ordering: fertilization inputs precede soil nutrient status, soil nutrient status may influence plant nutrient uptake, and plant nutrient uptake contributes to final biomass production.
+
+Structural equation modeling (SEM) is then used to evaluate whether the covariance structure observed in the data is broadly consistent with these proposed nutrient pathways. SEM is useful here because it allows several linked nutrient relationships to be estimated simultaneously and makes it possible to compare the relative strength of N, P, and K pathways within one coherent framework.
+
+The notebook compares two SEM specifications:
+
+- a mechanistic model that includes soil nutrient variables as mediators;
+- a simplified model that links fertilization inputs directly to plant nutrient uptake.
+
+The analysis should therefore be interpreted as a pathway-oriented investigation of productivity determinants rather than definitive proof of causal mechanisms.
+
+# Setup
+
+```{r}
+# Optional installs:
+# install.packages(c("dagitty", "lavaan", "dplyr", "readr", "ggplot2", "tidyr", "knitr"))
+
+library(dagitty)
+library(lavaan)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(kableExtra)
+```
+
+```{r}
+#| label: resolve-paths
+
+resolve_repo_path <- function(...) {
+  candidates <- c(".", "..")
+
+  for (base in candidates) {
+    candidate <- file.path(base, ...)
+    if (file.exists(candidate) || dir.exists(candidate)) {
+      return(candidate)
+    }
+  }
+
+  file.path(candidates[[1]], ...)
+}
+
+processed_data_dir <- resolve_repo_path("data", "processed")
+ww_data_path <- resolve_repo_path("data", "processed", "zofe_ww.csv")
+prep_script_path <- resolve_repo_path("src", "ZOFE_MVStat2_data_preparation.R")
+```
+
+# Data preparation
+
+The SEM uses the processed winter wheat dataset. If the prepared file is not yet present, the data preparation script is sourced first.
+
+```{r}
+#| label: load-data
+
+if (!file.exists(ww_data_path)) {
+  source(prep_script_path)
+}
+
+ZOFE_WW <- read_csv(ww_data_path, show_col_types = FALSE)
+
+glimpse(ZOFE_WW)
+```
+
+## Dataset structure to report
+
+Model complexity should be judged not only by the nominal number of rows, but also by the structure of the data. This is especially important here because the dataset contains repeated years, several fertilizer treatments, and replicated observations. These features mean that the effective amount of independent information may be smaller than the row count alone suggests.
+
+The following summary helps document the available information for judging model complexity and interaction testing.
+
+```{r}
+#| label: dataset-structure
+
+structure_summary <- tibble::tibble(
+  quantity = c(
+    "Number of observations",
+    "Number of years",
+    "First year",
+    "Last year",
+    "Number of treatments",
+    "Number of replicates"
+  ),
+  value = c(
+    nrow(ZOFE_WW),
+    n_distinct(ZOFE_WW$year),
+    min(ZOFE_WW$year, na.rm = TRUE),
+    max(ZOFE_WW$year, na.rm = TRUE),
+    n_distinct(ZOFE_WW$treatment_en),
+    n_distinct(ZOFE_WW$replicate)
+  )
+)
+
+structure_summary
+```
+
+```{r}
+#| label: missingness-summary
+
+vars_for_missingness <- c(
+  "fert_Nmin_tot",
+  "fert_P_tot",
+  "fert_K_tot",
+  "soil_0_20_Ntot",
+  "soil_0_20_P_test",
+  "soil_0_20_K_test",
+  "annual_N_uptake",
+  "annual_P_uptake",
+  "annual_K_uptake",
+  "annual_total_biomass_maincrop_DM"
+)
+
+missingness_summary <- ZOFE_WW %>%
+  summarise(across(all_of(vars_for_missingness), ~ mean(is.na(.x)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_percent") %>%
+  arrange(desc(missing_percent))
+
+missingness_summary
+```
+
+# Causal graph
+
+The assumed causal graph follows three parallel nutrient pathways:
+
+- nitrogen fertilization -\> soil nitrogen -\> nitrogen uptake -\> biomass;
+- phosphorus fertilization -\> soil phosphorus -\> phosphorus uptake -\> biomass;
+- potassium fertilization -\> soil potassium -\> potassium uptake -\> biomass.
+
+This graph is a scientific assumption used to organize the analysis. It does not prove that these causal effects are identified without ambiguity. Instead, it provides a transparent starting point for asking whether the observed data are consistent with a plausible nutrient-productivity pathway.
+
+```{r}
+#| label: create-dag
+
+dag <- dagitty('dag {
+bb="0,0,10,6"
+
+fert_Nmin_tot [pos="1,5"]
+soil_0_20_Ntot [pos="3,5"]
+annual_N_uptake [pos="5,5"]
+
+fert_P_tot [pos="1,3"]
+soil_0_20_P_test [pos="3,3"]
+annual_P_uptake [pos="5,3"]
+
+fert_K_tot [pos="1,1"]
+soil_0_20_K_test [pos="3,1"]
+annual_K_uptake [pos="5,1"]
+
+annual_total_biomass_maincrop_DM [pos="8,3"]
+
+fert_Nmin_tot -> soil_0_20_Ntot
+soil_0_20_Ntot -> annual_N_uptake
+annual_N_uptake -> annual_total_biomass_maincrop_DM
+
+fert_P_tot -> soil_0_20_P_test
+soil_0_20_P_test -> annual_P_uptake
+annual_P_uptake -> annual_total_biomass_maincrop_DM
+
+fert_K_tot -> soil_0_20_K_test
+soil_0_20_K_test -> annual_K_uptake
+annual_K_uptake -> annual_total_biomass_maincrop_DM
+}')
+
+plot(dag)
+```
+
+## Researcher checklist for the DAG
+
+Before interpreting SEM results, the DAG should be checked as a statement of biological assumptions.
+
+- The arrow directions are biologically plausible: fertilization precedes soil nutrient status, soil nutrient status can influence uptake, and uptake contributes to biomass.
+- The graph is likely incomplete because nutrient pathways can interact. For example, N, P, and K may act jointly through co-limitation or nutrient-use efficiency.
+- Fertilization variables should be allowed to correlate because fertilizer treatments are part of a management design rather than independent random exposures.
+- Important omitted variables may include year, weather, soil texture, treatment history, field plot effects, and cultivar or management differences.
+- Biomass is a reasonable productivity outcome, but yield would be an important complementary outcome if available.
+
+## DAG framing conclusion
+
+After reviewing the graph, the DAG is judged to be **partially adequate** for the research question. It captures a biologically plausible nutrient pathway from fertilization inputs to soil nutrient status, plant uptake, and biomass production. However, the DAG likely omits important determinants of biomass production, including environmental variation, year effects, and interactions among nutrient pathways. The most important structural issue to keep in mind before interpreting SEM coefficients is that the current DAG is a simplified representation of a complex long-term agricultural system.
+
+# SEM variables and scaling
+
+The SEM uses the variables included in the DAG. They are standardized before model fitting so path coefficients are easier to compare on a common scale. A one-unit change in a standardized variable corresponds to a one-standard-deviation change in the original variable.
+
+```{r}
+#| label: sem-variables
+
+vars_sem <- c(
+  "fert_Nmin_tot",
+  "soil_0_20_Ntot",
+  "annual_N_uptake",
+  "fert_P_tot",
+  "soil_0_20_P_test",
+  "annual_P_uptake",
+  "fert_K_tot",
+  "soil_0_20_K_test",
+  "annual_K_uptake",
+  "annual_total_biomass_maincrop_DM"
+)
+
+ZOFE_WW_sem <- ZOFE_WW %>%
+  select(all_of(vars_sem)) %>%
+  mutate(across(everything(), ~ as.numeric(scale(.x))))
+
+summary(ZOFE_WW_sem)
+```
+
+## Exploratory relationship plots
+
+Before relying on a linear SEM, it is useful to inspect whether the main uptake-biomass relationships look approximately linear or whether they may contain curvature, thresholds, or saturation.
+
+```{r}
+#| label: exploratory-uptake-biomass-plots
+#| fig-width: 7
+#| fig-height: 5
+
+ZOFE_WW %>%
+  select(
+    annual_total_biomass_maincrop_DM,
+    annual_N_uptake,
+    annual_P_uptake,
+    annual_K_uptake
+  ) %>%
+  pivot_longer(
+    cols = starts_with("annual_") & !annual_total_biomass_maincrop_DM,
+    names_to = "uptake_variable",
+    values_to = "uptake"
+  ) %>%
+  ggplot(aes(x = uptake, y = annual_total_biomass_maincrop_DM)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~ uptake_variable, scales = "free_x") +
+  labs(
+    x = "Plant nutrient uptake",
+    y = "Total main-crop biomass",
+    title = "Exploratory uptake-biomass relationships"
+  )
+```
+
+These plots are not causal evidence by themselves. They are diagnostic tools that help assess whether a linear SEM is likely to be an adequate summary of the relationships.
+
+# SEM 1: soil variables as mediators
+
+The first SEM follows the DAG directly. Each fertilizer variable predicts its soil nutrient measure, each soil measure predicts plant uptake, and nutrient uptake predicts total biomass. This model asks whether a mechanistic soil-mediated pathway structure helps explain variation in biomass production.
+
+```{r}
+#| label: sem-model-1
+
+sem_model <- '
+
+  soil_0_20_Ntot ~ fert_Nmin_tot
+  annual_N_uptake ~ soil_0_20_Ntot
+
+  soil_0_20_P_test ~ fert_P_tot
+  annual_P_uptake ~ soil_0_20_P_test
+
+  soil_0_20_K_test ~ fert_K_tot
+  annual_K_uptake ~ soil_0_20_K_test
+
+  annual_total_biomass_maincrop_DM ~ annual_N_uptake +
+                                     annual_P_uptake +
+                                     annual_K_uptake
+'
+
+fit <- sem(
+  model = sem_model,
+  data = ZOFE_WW_sem,
+  missing = "fiml",
+  fixed.x = FALSE
+)
+```
+
+```{r}
+#| label: sem-model-1-summary
+
+summary(
+  fit,
+  standardized = TRUE,
+  fit.measures = TRUE,
+  rsquare = TRUE
+)
+```
+
+
+## Formatted SEM 1 path table
+
+The table below reformats the SEM 1 regression paths into a report-friendly format. It combines the standardized estimate and confidence interval into one column and labels each path by nutrient pathway.
+
+
+```{r}
+#| label: tbl-sem1-formatted-paths
+#| tbl-cap: "SEM 1 regression paths with confidence intervals"
+
+sem1_paths_formatted <- parameterEstimates(
+  fit,
+  standardized = TRUE,
+  ci = TRUE
+) %>%
+  filter(op == "~") %>%
+  mutate(
+    equation = paste(lhs, "~", rhs),
+    pathway = case_when(
+      lhs == "annual_total_biomass_maincrop_DM" ~ "Biomass equation",
+      grepl("_N|Nmin|Ntot|N_uptake", lhs) |
+        grepl("_N|Nmin|Ntot|N_uptake", rhs) ~ "Nitrogen (N)",
+      grepl("_P|P_test|P_tot|P_uptake", lhs) |
+        grepl("_P|P_test|P_tot|P_uptake", rhs) ~ "Phosphorus (P)",
+      grepl("_K|K_test|K_tot|K_uptake", lhs) |
+        grepl("_K|K_test|K_tot|K_uptake", rhs) ~ "Potassium (K)",
+      TRUE ~ "Other"
+    ),
+    `est (95% CI)` = sprintf(
+      "%.3f (%.3f - %.3f)",
+      std.all,
+      ci.lower,
+      ci.upper
+    ),
+    p_value = if_else(
+      pvalue < 0.001,
+      "<0.001",
+      sprintf("%.3f", pvalue)
+    )
+  ) %>%
+  select(
+    Pathway = pathway,
+    Equation = equation,
+    `Std. est (95% CI)` = `est (95% CI)`,
+    `p-value` = p_value
+  )
+
+knitr::kable(
+  sem1_paths_formatted,
+  align = c("l", "l", "r", "r")
+)
+```
+
+
+
+```{r}
+#| label: sem-model-1-coefficients
+
+tbl_sem1 <- parameterEstimates(
+  fit,
+  standardized = TRUE,
+  ci = TRUE
+) %>%
+  filter(op %in% c("~", ":=")) %>%
+  select(lhs, op, rhs, est, se, ci.lower, ci.upper, pvalue, std.all) 
+tbl_sem1 %>%
+  knitr::kable()
+```
+
+| lhs | op | rhs | est | se | ci.lower | ci.upper | pvalue | std.all |
+|:------------|-------:|-------:|-------:|-------:|:-------|-------:|-------:|-------:|
+| soil_0_20_Ntot | \~ | fert_Nmin_tot | -0.76 | 0.06 | -0.88 | -0.64 | 0.00 | -0.68 |
+| annual_N_uptake | \~ | soil_0_20_Ntot | -0.47 | 0.04 | -0.54 | -0.40 | 0.00 | -0.54 |
+| soil_0_20_P_test | \~ | fert_P_tot | 0.47 | 0.03 | 0.41 | 0.54 | 0.00 | 0.47 |
+| annual_P_uptake | \~ | soil_0_20_P_test | 0.08 | 0.05 | -0.01 | 0.17 | 0.08 | 0.07 |
+| soil_0_20_K_test | \~ | fert_K_tot | 0.75 | 0.02 | 0.71 | 0.80 | 0.00 | 0.75 |
+| annual_K_uptake | \~ | soil_0_20_K_test | 0.35 | 0.04 | 0.27 | 0.43 | 0.00 | 0.31 |
+| annual_total_biomass_maincrop_DM | \~ | annual_N_uptake | 0.07 | 0.02 | 0.03 | 0.12 | 0.00 | 0.09 |
+| annual_total_biomass_maincrop_DM | \~ | annual_P_uptake | 0.48 | 0.02 | 0.44 | 0.52 | 0.00 | 0.77 |
+| annual_total_biomass_maincrop_DM | \~ | annual_K_uptake | 0.38 | 0.02 | 0.34 | 0.42 | 0.00 | 0.55 |
+
+```{r}
+#| label: sem-model-1-var-table
+
+
+## Formatted SEM 1 path table
+
+The table below reformats the SEM 1 regression paths into a report-friendly format. It combines the standardized estimate and confidence interval into one column and labels each path by nutrient pathway.
+
+```{r}
+#| label: tbl-sem1-formatted-paths
+#| tbl-cap: "SEM 1 regression paths with confidence intervals"
+
+sem1_paths_formatted <- parameterEstimates(
+  fit,
+  standardized = TRUE,
+  ci = TRUE
+) %>%
+  filter(op == "~") %>%
+  mutate(
+    equation = paste(lhs, "~", rhs),
+    pathway = case_when(
+      lhs == "annual_total_biomass_maincrop_DM" ~ "Biomass equation",
+      grepl("_N|Nmin|Ntot|N_uptake", lhs) |
+        grepl("_N|Nmin|Ntot|N_uptake", rhs) ~ "Nitrogen (N)",
+      grepl("_P|P_test|P_tot|P_uptake", lhs) |
+        grepl("_P|P_test|P_tot|P_uptake", rhs) ~ "Phosphorus (P)",
+      grepl("_K|K_test|K_tot|K_uptake", lhs) |
+        grepl("_K|K_test|K_tot|K_uptake", rhs) ~ "Potassium (K)",
+      TRUE ~ "Other"
+    ),
+    `est (95% CI)` = sprintf(
+      "%.3f (%.3f - %.3f)",
+      std.all,
+      ci.lower,
+      ci.upper
+    ),
+    p_value = if_else(
+      pvalue < 0.001,
+      "<0.001",
+      sprintf("%.3f", pvalue)
+    )
+  ) %>%
+  select(
+    Pathway = pathway,
+    Equation = equation,
+    `Std. est (95% CI)` = `est (95% CI)`,
+    `p-value` = p_value
+  )
+
+knitr::kable(
+  sem1_paths_formatted,
+  align = c("l", "l", "r", "r")
+)
+```
+
+
+varTable(fit)
+```
+
+## Interpretation of SEM 1
+
+The full mediator SEM has **poor overall fit**. The low CFI and TLI values and high RMSEA and SRMR values indicate that the covariance structure implied by the DAG does not reproduce the observed data well. This does not mean that every estimated path is uninformative, but it does mean that the full causal interpretation should be cautious.
+
+The standardized coefficients are useful for comparing pathway strength. In this model, phosphorus uptake and potassium uptake show the strongest positive associations with biomass production. Nitrogen uptake is much weaker in the biomass equation. This suggests that, within the current model specification, variation in biomass is more strongly aligned with P and K uptake than with N uptake.
+
+The nitrogen soil-mediated pathway is difficult to interpret because the estimated signs are negative. This is biologically surprising if interpreted naively. Possible explanations include measurement timing, depletion effects, treatment confounding, omitted year effects, or mismatch between the measured soil nitrogen variable and the biologically active nitrogen pool available to the crop.
+
+The phosphorus soil-to-uptake path is weak, suggesting that the measured soil P test may not explain annual P uptake well in this model. Potassium fertilization strongly predicts soil K, but soil K explains only part of K uptake.
+
+## SEM 1 conclusion
+
+In the full mediator SEM, the overall model fit was **poor** based on the low CFI and TLI values and the high RMSEA and SRMR values. The strongest biomass-related pathways were the phosphorus uptake -\> biomass and potassium uptake -\> biomass paths, while the weakest or most uncertain pathways included soil phosphorus -\> phosphorus uptake and the nitrogen soil-mediated pathway. Overall, this model suggests that P and K uptake are important correlates of biomass production, but the poor global fit indicates that the determinants of biomass production are more complex than represented by the current linear DAG.
+
+# SEM 2: simplified model without soil mediators
+
+The second SEM removes soil variables as mediators and links fertilization directly to plant nutrient uptake. This model should be interpreted as a reduced-complexity comparison model, not as proof that soil processes are unimportant. It asks whether the main nutrient-productivity relationships can be summarized more clearly without explicitly modeling measured soil nutrient status.
+
+```{r}
+#| label: sem-model-2
+
+sem_model2 <- '
+
+  annual_N_uptake ~ fert_Nmin_tot
+  annual_P_uptake ~ fert_P_tot
+  annual_K_uptake ~ fert_K_tot
+
+  annual_total_biomass_maincrop_DM ~ annual_N_uptake +
+                                      annual_P_uptake +
+                                      annual_K_uptake
+
+  fert_Nmin_tot ~~ fert_P_tot
+  fert_Nmin_tot ~~ fert_K_tot
+  fert_P_tot ~~ fert_K_tot
+'
+
+fit2 <- sem(
+  model = sem_model2,
+  data = ZOFE_WW_sem,
+  missing = "fiml",
+  fixed.x = FALSE
+)
+```
+
+```{r}
+#| label: sem-model-2-summary
+
+summary(
+  fit2,
+  standardized = TRUE,
+  fit.measures = TRUE,
+  rsquare = TRUE
+)
+```
+
+```{r}
+#| label: sem-model-2-coefficients
+
+parameterEstimates(
+  fit2,
+  standardized = TRUE,
+  ci = TRUE
+) %>%
+  filter(op %in% c("~", ":=")) %>%
+  select(lhs, op, rhs, est, se, ci.lower, ci.upper, pvalue, std.all)
+```
+
+## Interpretation of SEM 2
+
+The simplified SEM does not clearly solve the model-fit problem. Some fit indices may change slightly, but the overall evidence still suggests poor global fit. This means that simplifying the model does not fully capture the determinants of biomass production.
+
+However, the direct fertilization-to-uptake paths are easier to interpret biologically than some of the soil-mediated paths. In particular, the direct N and K fertilization-to-uptake associations are positive and clearer than the corresponding soil-mediated nitrogen pathway in SEM 1.
+
+The biomass equation remains similar across both models: phosphorus uptake and potassium uptake are the dominant positive predictors of biomass, while nitrogen uptake contributes much less after accounting for P and K uptake.
+
+## SEM 2 conclusion
+
+In the simplified SEM, model fit was **not clearly improved** compared with the full mediator model. The direct fertilization-to-uptake paths were more stable and more biologically interpretable, suggesting that the measured soil mediator variables may not fully capture the relevant nutrient availability processes. This simplified specification is useful mainly as a sensitivity analysis because it confirms that P and K uptake remain the strongest biomass-associated nutrient pathways, but it removes mechanistic detail about soil nutrient status.
+
+# Model comparison
+
+The fit indices can be extracted compactly for side-by-side comparison.
+
+```{r}
+#| label: compare-fit-measures
+
+fit_comparison <- rbind(
+  sem_with_soil_mediators = fitMeasures(
+    fit,
+    c("chisq", "df", "pvalue", "cfi", "tli", "rmsea", "srmr")
+  ),
+  sem_without_soil_mediators = fitMeasures(
+    fit2,
+    c("chisq", "df", "pvalue", "cfi", "tli", "rmsea", "srmr")
+  )
+)
+
+round(fit_comparison, 3)
+```
+
+## Model comparison interpretation
+
+The preferred reporting strategy is to present **both models as complementary analyses**. SEM 1 is more mechanistic because it represents the hypothesized soil-mediated nutrient pathway. SEM 2 is more parsimonious and easier to interpret, but it removes the soil mechanism.
+
+The main conclusion is not that one model perfectly explains biomass production. Instead, the comparison shows that both model specifications point to strong P and K uptake associations with biomass, while also showing that the overall linear pathway structure is incomplete.
+
+# Confidence intervals and uncertainty
+
+Confidence intervals are meaningful in SEM and should be reported where possible. They are especially useful for distinguishing strong, stable pathways from weak or uncertain pathways. For mediation and indirect effects, bootstrap confidence intervals are often preferable because indirect effects are products of coefficients and may not be normally distributed.
+
+A bootstrap version of the SEM can be fitted as follows. This is not run by default because it can take longer to render.
+
+```{r eval=FALSE}
+fit_boot <- sem(
+  sem_model,
+  data = ZOFE_WW_sem,
+  missing = "fiml",
+  fixed.x = FALSE,
+  se = "bootstrap",
+  bootstrap = 2000
+)
+
+parameterEstimates(
+  fit_boot,
+  standardized = TRUE,
+  ci = TRUE
+)
+```
+
+# Suggested additional analyses within this notebook
+
+The following analyses would require only modest extensions to the current notebook and would improve interpretation.
+
+| Suggested edit | Reason | Section it contributes to |
+|------------------------|------------------------|------------------------|
+| Add confidence intervals for SEM coefficients | Shows uncertainty around path estimates and helps avoid over-reliance on p-values | SEM 1, SEM 2, model comparison |
+| Add exploratory scatterplots with smooth curves | Helps assess whether linear SEM assumptions are plausible | SEM variables and scaling; interpretation |
+| Report dataset structure and missingness | Helps judge model complexity, interaction testing, and reliability of estimates | Data preparation; limitations |
+| Estimate indirect effects explicitly | Aligns the model output with the pathway/mediation research question | SEM 1 interpretation |
+| Test a very small number of biologically motivated nutrient interactions | Poor fit may reflect nutrient co-limitation or synergy | DAG discussion; model comparison |
+
+Interaction testing should be limited. Although the dataset has many observations, the effective information is reduced by repeated years, treatment structure, and missingness. A reasonable first step would be to test only a few biologically motivated pairwise interactions such as N x P, N x K, and P x K, rather than all possible interactions.
+
+# Outlook: analyses appropriate for a separate notebook
+
+Several extensions would likely require a separate notebook because they change the modeling framework or require substantial diagnostics.
+
+## Nonlinear modeling
+
+Generalized additive models, random forests, or gradient boosting could be used to explore nonlinear nutrient responses, saturation, thresholds, and interactions. These methods may help detect shapes that are not captured by linear SEM. However, they are primarily predictive or exploratory tools and do not replace causal pathway modeling.
+
+## Cross-validation and prediction
+
+If flexible models such as random forests or GAMs are used, cross-validation is needed to evaluate overfitting. Because the dataset spans multiple years, validation should ideally respect the temporal structure. For example, models could be trained on earlier years and tested on later years.
+
+## Multilevel or hierarchical models
+
+The data likely contain grouping structure from years, treatments, plots, and replicates. A multilevel SEM or mixed-effects modeling framework could represent year-to-year variation and repeated-measures dependence more explicitly.
+
+## Expanded DAG development
+
+A more complete DAG could include weather, soil texture, treatment history, management practices, and yield components. This would help evaluate whether the poor SEM fit arises from omitted causal structure.
+
+## Bayesian SEM
+
+A Bayesian SEM could provide full posterior uncertainty distributions and may be useful when comparing alternative pathway structures under uncertainty.
+
+# Final reporting summary
+
+The DAG-guided SEM analysis examined to what extent variation in winter wheat biomass production could be explained by fertilization inputs, soil nutrient status, and plant nutrient uptake pathways. Across both SEM specifications, phosphorus and potassium uptake pathways showed the strongest positive associations with biomass production, whereas nitrogen-related pathways appeared weaker and less stable. The comparison between the mechanistic and simplified SEM structures suggested that explicitly modeling soil mediators did not substantially improve overall model fit, indicating that biomass production is likely influenced by additional processes not represented in the current DAG. Overall, the analysis supports the interpretation that phosphorus and potassium uptake are important contributors to productivity variation in this dataset, while also highlighting the limitations of simplified linear pathway models for representing complex agricultural systems.
