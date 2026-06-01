@@ -1,0 +1,57 @@
+---
+title: "Methodological approach"
+format:
+  pptx:
+    slide-level: 2
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Methods and rationale
+
+**Research aim:** identify which fertilization-related nutrient pathways are most strongly associated with winter wheat biomass production, and whether nonlinear or interaction patterns suggest structure beyond a simple mechanistic model.
+
+::: columns
+::: {.column width="33%"}
+
+### EDA
+
+Used to describe the data structure before modeling:
+
+- biomass variation across treatments and years;
+- fertilizer nutrient composition;
+- correlations among fertilizer, soil, uptake, and biomass variables.
+
+:::
+
+::: {.column width="34%"}
+
+### DAG-guided SEM
+
+Used to evaluate a biologically motivated pathway:
+
+**Fertilizer → soil nutrient status → nutrient uptake → biomass**
+
+SEM estimates pathway strengths for N, P, and K and tests whether the observed covariance structure is consistent with the assumed causal story.
+
+:::
+
+::: {.column width="33%"}
+
+### Random Forest
+
+Used as an exploratory complement to SEM:
+
+- nonlinear nutrient-biomass relationships;
+- nutrient interactions;
+- year-specific effects;
+- variable importance and partial dependence plots.
+
+Year is treated as a categorical factor.
+
+:::
+:::
+
+**Combined rationale:** SEM provides interpretable, assumption-driven pathway evidence; Random Forest tests whether flexible nonlinear patterns support, refine, or challenge the SEM interpretation.
