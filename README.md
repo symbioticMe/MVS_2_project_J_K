@@ -49,6 +49,7 @@ Klaus Jarosh: dataset owner/provider and domain context
  - dataset preparation
  - result interpretation
  - causality modeling implementation and adaptation
+   
 Jelena Čuklina: repository maintainer, modeling setup
  - prediction modeling
  - assistance in causal modeling setup and interpretation
